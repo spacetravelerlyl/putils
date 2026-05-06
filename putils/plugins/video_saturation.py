@@ -489,6 +489,11 @@ class VideoSaturationPanel(ttk.Frame):
                 "error",
                 "-print_format",
                 "json",
+                "-show_entries",
+                (
+                    "format=duration,bit_rate:"
+                    "stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate"
+                ),
                 "-show_format",
                 "-show_streams",
                 str(path),
