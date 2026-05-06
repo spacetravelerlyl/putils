@@ -20,6 +20,8 @@ From the project directory:
 python -m putils
 ```
 
+The default interface language is Chinese. Use the language button in the top-right corner to switch between Chinese and English.
+
 ## Dependency Status
 
 The top panel shows dependency status reported by each plugin.
@@ -41,6 +43,8 @@ Click `Check` to refresh dependency status. If `ffmpeg` is missing, install it a
 3. Click `Add Videos` and select one or more video files.
 4. Optional: choose an output directory with `Browse`.
 5. Click `Run`.
+
+The progress bar shows batch processing progress. Each completed or failed file advances the progress count.
 
 If no output directory is selected, each output file is written next to its source video.
 

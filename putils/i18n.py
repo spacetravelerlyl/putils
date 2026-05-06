@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+
+DEFAULT_LANGUAGE = "zh"
+SUPPORTED_LANGUAGES = ("zh", "en")
+
+
+TRANSLATIONS: dict[str, dict[str, str]] = {
+    "zh": {
+        "app.title": "PUtils 工具箱",
+        "language.switch_to_en": "English",
+        "language.switch_to_zh": "中文",
+        "dependency.title": "依赖状态",
+        "dependency.check": "检查",
+        "dependency.plugin": "插件",
+        "dependency.dependency": "依赖",
+        "dependency.type": "类型",
+        "dependency.required": "必需",
+        "dependency.status": "状态",
+        "dependency.version": "版本",
+        "dependency.path": "路径",
+        "dependency.message": "说明",
+        "dependency.no_plugins": "无插件",
+        "dependency.no_check.name": "插件依赖检查",
+        "dependency.no_check.message": "插件未提供依赖检查",
+        "dependency.no_external.name": "无外部依赖",
+        "dependency.yes": "是",
+        "dependency.no": "否",
+        "dependency.available": "可用",
+        "dependency.missing": "缺失",
+        "logs.title": "操作日志",
+        "logs.refresh": "刷新",
+        "logs.created_at": "创建时间",
+        "logs.plugin_id": "插件",
+        "logs.level": "级别",
+        "logs.message": "消息",
+        "plugins.none": "未找到插件。",
+        "plugins.tab": "插件",
+        "plugin.video_saturation.name": "视频饱和度",
+        "video_saturation.saturation_ratio": "饱和度比例",
+        "video_saturation.output_directory": "输出目录",
+        "video_saturation.browse": "浏览",
+        "video_saturation.add_videos": "添加视频",
+        "video_saturation.clear": "清空",
+        "video_saturation.run": "运行",
+        "video_saturation.video": "视频",
+        "video_saturation.status": "状态",
+        "video_saturation.progress": "处理进度",
+        "video_saturation.ready": "就绪",
+        "video_saturation.pending": "待处理",
+        "video_saturation.running": "处理中",
+        "video_saturation.failed": "失败",
+        "video_saturation.completed": "已完成",
+        "video_saturation.selected": "已选择 {count} 个文件",
+        "video_saturation.progress_text": "{completed}/{total} 已完成",
+        "video_saturation.finished": "完成：{completed}/{total} 已完成",
+        "video_saturation.no_videos.title": "未选择视频",
+        "video_saturation.no_videos.message": "请至少添加一个视频文件。",
+        "video_saturation.ffmpeg_missing.title": "未找到 ffmpeg",
+        "video_saturation.ffmpeg_missing.message": "请安装 ffmpeg，并确保它在 PATH 中。",
+        "video_saturation.select_output_dir": "选择输出目录",
+        "video_saturation.select_videos": "选择视频",
+        "video_saturation.file_types.video": "视频文件",
+        "video_saturation.file_types.all": "所有文件",
+        "video_saturation.dependency.ffmpeg_missing": "请安装 ffmpeg，并确保它在 PATH 中。",
+        "video_saturation.dependency.ready": "就绪",
+        "video_saturation.dependency.version_failed": "已找到命令，但版本检查失败：{error}",
+    },
+    "en": {
+        "app.title": "PUtils",
+        "language.switch_to_en": "English",
+        "language.switch_to_zh": "中文",
+        "dependency.title": "Dependency Status",
+        "dependency.check": "Check",
+        "dependency.plugin": "Plugin",
+        "dependency.dependency": "Dependency",
+        "dependency.type": "Type",
+        "dependency.required": "Required",
+        "dependency.status": "Status",
+        "dependency.version": "Version",
+        "dependency.path": "Path",
+        "dependency.message": "Message",
+        "dependency.no_plugins": "No plugins",
+        "dependency.no_check.name": "Plugin dependency check",
+        "dependency.no_check.message": "No dependency check provided",
+        "dependency.no_external.name": "No external dependencies",
+        "dependency.yes": "Yes",
+        "dependency.no": "No",
+        "dependency.available": "Available",
+        "dependency.missing": "Missing",
+        "logs.title": "Operation Logs",
+        "logs.refresh": "Refresh",
+        "logs.created_at": "Created At",
+        "logs.plugin_id": "Plugin",
+        "logs.level": "Level",
+        "logs.message": "Message",
+        "plugins.none": "No plugins found.",
+        "plugins.tab": "Plugins",
+        "plugin.video_saturation.name": "Video Saturation",
+        "video_saturation.saturation_ratio": "Saturation ratio",
+        "video_saturation.output_directory": "Output directory",
+        "video_saturation.browse": "Browse",
+        "video_saturation.add_videos": "Add Videos",
+        "video_saturation.clear": "Clear",
+        "video_saturation.run": "Run",
+        "video_saturation.video": "Video",
+        "video_saturation.status": "Status",
+        "video_saturation.progress": "Progress",
+        "video_saturation.ready": "Ready",
+        "video_saturation.pending": "Pending",
+        "video_saturation.running": "Running",
+        "video_saturation.failed": "Failed",
+        "video_saturation.completed": "Completed",
+        "video_saturation.selected": "{count} file(s) selected",
+        "video_saturation.progress_text": "{completed}/{total} completed",
+        "video_saturation.finished": "Finished: {completed}/{total} completed",
+        "video_saturation.no_videos.title": "No videos",
+        "video_saturation.no_videos.message": "Please add at least one video file.",
+        "video_saturation.ffmpeg_missing.title": "ffmpeg not found",
+        "video_saturation.ffmpeg_missing.message": "Please install ffmpeg and make sure it is on PATH.",
+        "video_saturation.select_output_dir": "Select output directory",
+        "video_saturation.select_videos": "Select videos",
+        "video_saturation.file_types.video": "Video files",
+        "video_saturation.file_types.all": "All files",
+        "video_saturation.dependency.ffmpeg_missing": "Install ffmpeg and make sure it is on PATH.",
+        "video_saturation.dependency.ready": "Ready",
+        "video_saturation.dependency.version_failed": "Found command but version check failed: {error}",
+    },
+}
+
+
+class Translator:
+    def __init__(self, language: str = DEFAULT_LANGUAGE) -> None:
+        self.language = normalize_language(language)
+
+    def set_language(self, language: str) -> None:
+        self.language = normalize_language(language)
+
+    def t(self, key: str, default: str | None = None, **kwargs: object) -> str:
+        text = TRANSLATIONS.get(self.language, {}).get(key)
+        if text is None:
+            text = TRANSLATIONS[DEFAULT_LANGUAGE].get(key, default if default is not None else key)
+        return text.format(**kwargs) if kwargs else text
+
+
+def normalize_language(language: str) -> str:
+    return language if language in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+

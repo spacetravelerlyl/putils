@@ -9,6 +9,7 @@ PUtils is a cross-platform desktop utility host for Windows and Linux. It provid
 - SQLite-based operation logging in a separate database.
 - A bundled ffmpeg plugin that batch-adjusts video saturation.
 - A plugin-provided dependency check mechanism displayed by the host UI.
+- Internationalized UI text with Chinese as the default language and English as the first alternate language.
 
 ## Technology Selection
 
@@ -19,6 +20,7 @@ PUtils is a cross-platform desktop utility host for Windows and Linux. It provid
 | Configuration DB | sqlite3 | Standard library support, no server process, portable files. |
 | Operation Log DB | sqlite3 | Separate DB isolates logs from configuration and allows independent retention later. |
 | Plugin Model | Python modules with `create_plugin()` | Minimal runtime overhead and easy extension. |
+| Internationalization | Translation keys in `putils/i18n.py` | Simple to extend and available to plugins through `context.t(...)`. |
 | Video Processing | External `ffmpeg` executable | Mature codec support and predictable CLI behavior. |
 
 ## Directory Layout
@@ -28,6 +30,7 @@ putils/
   __main__.py              # python -m putils entry
   app.py                   # Tkinter application shell
   database.py              # ConfigStore and LogStore
+  i18n.py                  # Translation catalog and translator
   paths.py                 # Cross-platform data paths
   plugin_api.py            # Plugin contracts
   plugin_loader.py         # Bundled plugin discovery
@@ -43,11 +46,12 @@ docs/
 1. Keep the host application small: UI shell, plugin discovery, configuration access, and logging access.
 2. Give each plugin a metadata object and a `build(parent, context)` method.
 3. Let each plugin provide dependency status checks for external commands or libraries.
-4. Store configuration in `config.sqlite3` under a namespaced key-value table.
-5. Store operation logs in `logs.sqlite3` under an append-only operation log table.
-6. Let video processing run in a background thread so the GUI remains responsive.
-7. Use `ffmpeg -vf eq=saturation=<ratio> -c:a copy` for saturation changes.
-8. Produce output filenames as `<original>_saturation_adjusted.<ext>`.
+4. Resolve visible UI text through translation keys. Chinese is the default language.
+5. Store configuration in `config.sqlite3` under a namespaced key-value table.
+6. Store operation logs in `logs.sqlite3` under an append-only operation log table.
+7. Let video processing run in a background thread so the GUI remains responsive.
+8. Use `ffmpeg -vf eq=saturation=<ratio> -c:a copy` for saturation changes.
+9. Produce output filenames as `<original>_saturation_adjusted.<ext>`.
 
 ## SQLite Files
 
@@ -131,6 +135,70 @@ The `context` object provides:
 - `get_config(namespace, key, default=None)`
 - `set_config(namespace, key, value)`
 - `log(plugin_id, level, message, details=None)`
+- `t(key, default=None, **kwargs)`
+
+## Internationalization
+
+The application uses `putils/i18n.py` as the translation catalog. Chinese (`zh`) is the default language. English (`en`) is currently available through the language switch button in the main window.
+
+The selected language is stored in the configuration database:
+
+```text
+namespace: app
+key: language
+```
+
+### Adding A Language
+
+To add another language:
+
+1. Add the language code to `SUPPORTED_LANGUAGES` in `putils/i18n.py`.
+2. Add a matching entry to `TRANSLATIONS`.
+3. Provide translations for all existing keys.
+4. Add any new plugin keys under a stable prefix such as `plugin_id.feature.label`.
+
+Example:
+
+```python
+SUPPORTED_LANGUAGES = ("zh", "en", "ja")
+
+TRANSLATIONS = {
+    "ja": {
+        "app.title": "PUtils",
+        "...": "...",
+    },
+}
+```
+
+### Plugin UI Text
+
+Plugins should not hard-code visible text. Use `context.t(...)`:
+
+```python
+ttk.Label(self, text=context.t("my_plugin.input_file")).grid(...)
+```
+
+For dynamic text:
+
+```python
+context.t("my_plugin.selected_count", count=3)
+```
+
+Translation entry:
+
+```python
+"my_plugin.selected_count": "已选择 {count} 个文件"
+```
+
+If a plugin needs to update existing widgets after language switching, implement `set_language()` on the plugin panel:
+
+```python
+class MyPluginPanel(ttk.Frame):
+    def set_language(self) -> None:
+        self.run_button.configure(text=self.context.t("my_plugin.run"))
+```
+
+The host calls `set_language()` automatically for plugin panels when the language changes.
 
 ## Dependency Status
 
@@ -210,7 +278,12 @@ class MyPluginPanel(ttk.Frame):
         self.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
 
-        ttk.Label(self, text="My plugin UI").grid(row=0, column=0, sticky="w")
+        self.title_label = ttk.Label(self)
+        self.title_label.grid(row=0, column=0, sticky="w")
+        self.set_language()
+
+    def set_language(self) -> None:
+        self.title_label.configure(text=self.context.t("my_plugin.title"))
 
 
 def create_plugin() -> MyPlugin:
@@ -245,6 +318,8 @@ class MyPluginPanel(ttk.Frame):
 Use `ttk` widgets where possible so the plugin matches the host application's theme.
 
 If the plugin runs long work, run it in a background thread and update Tk widgets through `widget.after(...)`. Tkinter widgets and variables should not be read or mutated directly from worker threads.
+
+For long-running batch tasks, expose progress in the plugin UI with `ttk.Progressbar` and a textual status label. The video saturation plugin uses a determinate progress bar based on processed file count.
 
 ### Configuration
 
@@ -375,8 +450,11 @@ Before considering a plugin complete:
 - Provide `create_plugin()`.
 - Implement `build(parent, context)`.
 - Implement `check_dependencies(context)`.
+- Use `context.t(...)` for visible text.
+- Implement `set_language()` if the plugin creates widgets whose text must change after language switching.
 - Store user-facing settings through `context.set_config(...)`.
 - Write start, success, and failure logs through `context.log(...)`.
+- Show progress for long-running operations.
 - Keep long-running work off the Tkinter main thread.
 - Run `python -m compileall -q putils`.
 

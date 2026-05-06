@@ -34,6 +34,9 @@ class PluginContext(Protocol):
     def log(self, plugin_id: str, level: str, message: str, details: dict | None = None) -> None:
         ...
 
+    def t(self, key: str, default: str | None = None, **kwargs: object) -> str:
+        ...
+
 
 class UtilityPlugin(Protocol):
     metadata: PluginMetadata
