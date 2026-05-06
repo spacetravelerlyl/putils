@@ -44,7 +44,9 @@ Click `Check` to refresh dependency status. If `ffmpeg` is missing, install it a
 4. Optional: choose an output directory with `Browse`.
 5. Click `Run`.
 
-The progress bar shows batch processing progress. Each completed or failed file advances the progress count.
+The colored progress bar shows batch processing progress. Blue means processing, green means all files completed successfully, and red means at least one file failed. Each completed or failed file advances the progress count.
+
+After processing finishes, click `Clear` to remove the current file list and reset the progress display.
 
 If no output directory is selected, each output file is written next to its source video.
 

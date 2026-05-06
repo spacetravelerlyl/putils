@@ -319,7 +319,7 @@ Use `ttk` widgets where possible so the plugin matches the host application's th
 
 If the plugin runs long work, run it in a background thread and update Tk widgets through `widget.after(...)`. Tkinter widgets and variables should not be read or mutated directly from worker threads.
 
-For long-running batch tasks, expose progress in the plugin UI with `ttk.Progressbar` and a textual status label. The video saturation plugin uses a determinate progress bar based on processed file count.
+For long-running batch tasks, expose progress in the plugin UI with a progress indicator and a textual status label. The video saturation plugin uses a custom Canvas progress bar so progress color is consistent across Windows and Linux themes.
 
 ### Configuration
 

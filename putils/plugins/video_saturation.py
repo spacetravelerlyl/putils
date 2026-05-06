@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import threading
+from functools import partial
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -87,6 +88,11 @@ class VideoSaturationPanel(ttk.Frame):
         self.progress = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="0%")
         self.running = False
+        self.worker_thread: threading.Thread | None = None
+        self.run_generation = 0
+        self.progress_fill = None
+        self.progress_label_window = None
+        self.progress_color = "#9ca3af"
 
         self.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
@@ -139,10 +145,22 @@ class VideoSaturationPanel(ttk.Frame):
         progress_frame.columnconfigure(1, weight=1)
         self.progress_label = ttk.Label(progress_frame)
         self.progress_label.grid(row=0, column=0, sticky="w")
-        ttk.Progressbar(progress_frame, variable=self.progress, maximum=100, mode="determinate").grid(
-            row=0, column=1, sticky="ew", padx=(8, 8)
+        self.progress_canvas = tk.Canvas(
+            progress_frame,
+            height=18,
+            highlightthickness=0,
+            background="#e5e7eb",
         )
-        ttk.Label(progress_frame, textvariable=self.progress_text, width=8).grid(row=0, column=2, sticky="e")
+        self.progress_canvas.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        self.progress_fill = self.progress_canvas.create_rectangle(0, 0, 0, 18, fill="#9ca3af", outline="")
+        self.progress_label_window = self.progress_canvas.create_text(
+            0,
+            9,
+            text="0%",
+            fill="#111827",
+            anchor="center",
+        )
+        self.progress_canvas.bind("<Configure>", lambda _event: self._redraw_progress())
 
         columns = ("path", "status")
         self.file_tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
@@ -188,14 +206,17 @@ class VideoSaturationPanel(ttk.Frame):
         self._set_status("video_saturation.selected", count=len(self.files))
 
     def _clear_files(self) -> None:
-        if self.running:
+        if self.running and self.worker_thread is not None and self.worker_thread.is_alive():
             return
+        self.run_generation += 1
+        self.running = False
         self.files.clear()
         self.item_status_keys.clear()
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
         self.progress.set(0)
         self.progress_text.set("0%")
+        self._redraw_progress("#9ca3af")
         self._set_status("video_saturation.ready")
 
     def _run(self) -> None:
@@ -218,22 +239,36 @@ class VideoSaturationPanel(ttk.Frame):
 
         output_dir = self.output_dir.get().strip()
         files = list(self.files)
+        self.run_generation += 1
+        generation = self.run_generation
         self.context.set_config(CONFIG_NAMESPACE, "output_dir", output_dir)
         self.running = True
         self.run_button.configure(state=tk.DISABLED)
         self.progress.set(0)
         self.progress_text.set("0%")
+        self._redraw_progress("#2563eb")
         self._set_status("video_saturation.running")
         saturation = round(float(self.saturation.get()), 2)
-        worker = threading.Thread(target=self._run_worker, args=(ffmpeg_path, saturation, output_dir, files), daemon=True)
-        worker.start()
+        self.worker_thread = threading.Thread(
+            target=self._run_worker,
+            args=(ffmpeg_path, saturation, output_dir, files, generation),
+            daemon=True,
+        )
+        self.worker_thread.start()
 
-    def _run_worker(self, ffmpeg_path: str, saturation: float, output_dir: str, files: list[Path]) -> None:
+    def _run_worker(
+        self,
+        ffmpeg_path: str,
+        saturation: float,
+        output_dir: str,
+        files: list[Path],
+        generation: int,
+    ) -> None:
         total = len(files)
         completed = 0
         processed = 0
         for input_path in files:
-            self._set_item_status(input_path, "video_saturation.running")
+            self._set_item_status(input_path, "video_saturation.running", generation)
             output_path = self._output_path_for(input_path, output_dir)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cmd = [
@@ -263,7 +298,7 @@ class VideoSaturationPanel(ttk.Frame):
                     "Saturation adjustment failed",
                     {"input": str(input_path), "output": str(output_path), "stderr": stderr},
                 )
-                self._set_item_status(input_path, "video_saturation.failed")
+                self._set_item_status(input_path, "video_saturation.failed", generation)
             except Exception as exc:
                 self.context.log(
                     PLUGIN_ID,
@@ -271,7 +306,7 @@ class VideoSaturationPanel(ttk.Frame):
                     "Saturation adjustment failed",
                     {"input": str(input_path), "output": str(output_path), "error": str(exc)},
                 )
-                self._set_item_status(input_path, "video_saturation.failed")
+                self._set_item_status(input_path, "video_saturation.failed", generation)
             else:
                 completed += 1
                 self.context.log(
@@ -280,19 +315,30 @@ class VideoSaturationPanel(ttk.Frame):
                     "Saturation adjustment completed",
                     {"input": str(input_path), "output": str(output_path)},
                 )
-                self._set_item_status(input_path, "video_saturation.completed")
+                self._set_item_status(input_path, "video_saturation.completed", generation)
             processed += 1
-            self.after(0, self._update_progress, processed, total)
-            self.after(0, self._set_status, "video_saturation.progress_text", completed=completed, total=total)
+            self.after(0, self._update_progress, processed, total, "#2563eb", generation)
+            self.after(
+                0,
+                partial(
+                    self._set_status,
+                    "video_saturation.progress_text",
+                    generation,
+                    completed=completed,
+                    total=total,
+                ),
+            )
 
-        self.after(0, self._finish_run, completed, total)
+        self.after(0, self._finish_run, completed, total, generation)
 
     def _output_path_for(self, input_path: Path, output_dir: str) -> Path:
         directory = Path(output_dir).expanduser() if output_dir else input_path.parent
         return directory / f"{input_path.stem}_saturation_adjusted{input_path.suffix}"
 
-    def _set_item_status(self, input_path: Path, status_key: str) -> None:
+    def _set_item_status(self, input_path: Path, status_key: str, generation: int | None = None) -> None:
         def update() -> None:
+            if generation is not None and generation != self.run_generation:
+                return
             iid = str(input_path)
             self.item_status_keys[iid] = status_key
             if self.file_tree.exists(iid):
@@ -300,17 +346,47 @@ class VideoSaturationPanel(ttk.Frame):
 
         self.after(0, update)
 
-    def _finish_run(self, completed: int, total: int) -> None:
+    def _finish_run(self, completed: int, total: int, generation: int) -> None:
+        if generation != self.run_generation:
+            return
         self.running = False
         self.run_button.configure(state=tk.NORMAL)
-        self._set_status("video_saturation.finished", completed=completed, total=total)
+        self._update_progress(total, total, "#16a34a" if completed == total else "#dc2626", generation)
+        self._set_status("video_saturation.finished", generation, completed=completed, total=total)
 
-    def _update_progress(self, processed: int, total: int) -> None:
+    def _update_progress(
+        self,
+        processed: int,
+        total: int,
+        color: str = "#2563eb",
+        generation: int | None = None,
+    ) -> None:
+        if generation is not None and generation != self.run_generation:
+            return
         percent = round((processed / total) * 100, 1) if total else 0
         self.progress.set(percent)
         self.progress_text.set(f"{percent:g}%")
+        self._redraw_progress(color)
 
-    def _set_status(self, key: str, **kwargs: object) -> None:
+    def _redraw_progress(self, color: str | None = None) -> None:
+        if color is not None:
+            self.progress_color = color
+        self._draw_progress()
+
+    def _draw_progress(self) -> None:
+        width = max(self.progress_canvas.winfo_width(), 1)
+        height = max(self.progress_canvas.winfo_height(), 18)
+        fill_width = width * float(self.progress.get()) / 100
+        if self.progress_fill is not None:
+            self.progress_canvas.coords(self.progress_fill, 0, 0, fill_width, height)
+            self.progress_canvas.itemconfigure(self.progress_fill, fill=self.progress_color)
+        if self.progress_label_window is not None:
+            self.progress_canvas.coords(self.progress_label_window, width / 2, height / 2)
+            self.progress_canvas.itemconfigure(self.progress_label_window, text=self.progress_text.get())
+
+    def _set_status(self, key: str, generation: int | None = None, **kwargs: object) -> None:
+        if generation is not None and generation != self.run_generation:
+            return
         self.status_key = key
         self.status_kwargs = kwargs
         self.status.set(self.context.t(key, **kwargs))
