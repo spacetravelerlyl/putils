@@ -444,11 +444,11 @@ class VideoSaturationPanel(ttk.Frame):
         input_path, output_path = pair
         self._close_preview()
         filter_complex = (
-            "[0:v]setpts=PTS-STARTPTS,scale=-2:540,"
-            "pad=iw+8:ih+8:4:4:color=white[left];"
-            "[1:v]setpts=PTS-STARTPTS,scale=-2:540,"
-            "pad=iw+8:ih+8:4:4:color=white[right];"
-            "[left][right]hstack=inputs=2:shortest=1[v]"
+            f"movie='{self._escape_ffmpeg_filter_path(input_path)}',setpts=PTS-STARTPTS,"
+            "scale=-2:540,pad=iw+8:ih+8:4:4:color=white[left];"
+            f"movie='{self._escape_ffmpeg_filter_path(output_path)}',setpts=PTS-STARTPTS,"
+            "scale=-2:540,pad=iw+8:ih+8:4:4:color=white[right];"
+            "[left][right]hstack=inputs=2:shortest=1"
         )
         self.preview_process = subprocess.Popen(
             [
@@ -457,14 +457,10 @@ class VideoSaturationPanel(ttk.Frame):
                 "-an",
                 "-window_title",
                 self.context.t("video_saturation.preview.window_title"),
+                "-f",
+                "lavfi",
                 "-i",
-                str(input_path),
-                "-i",
-                str(output_path),
-                "-filter_complex",
                 filter_complex,
-                "-map",
-                "[v]",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -704,6 +700,20 @@ class VideoSaturationPanel(ttk.Frame):
             return f"{float(numerator) / denominator_value:.2f} fps"
         except ValueError:
             return "-"
+
+    def _escape_ffmpeg_filter_path(self, path: Path) -> str:
+        value = str(path)
+        for source, target in (
+            ("\\", "\\\\"),
+            (":", "\\:"),
+            ("'", "\\'"),
+            ("[", "\\["),
+            ("]", "\\]"),
+            (",", "\\,"),
+            (";", "\\;"),
+        ):
+            value = value.replace(source, target)
+        return value
 
     def _finish_run(self, completed: int, total: int, generation: int) -> None:
         if generation != self.run_generation:
