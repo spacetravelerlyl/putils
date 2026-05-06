@@ -64,6 +64,8 @@ class PUtilsApp(tk.Tk):
         self.plugins = []
         self.plugin_panels: list[object] = []
         self.empty_plugin_label = None
+        self.empty_plugin_tab_index: int | None = None
+        self.plugin_tab_indices: list[int] = []
         self.settings_frame = None
         self.settings_tab_index: int | None = None
         self.language_display_to_code: dict[str, str] = {}
@@ -83,6 +85,15 @@ class PUtilsApp(tk.Tk):
             style.theme_use("clam")
         style.configure("TButton", padding=(10, 5))
         style.configure("TLabel", padding=(0, 2))
+        style.configure(
+            "Treeview",
+            borderwidth=1,
+            relief="solid",
+            rowheight=24,
+            background="#ffffff",
+            fieldbackground="#ffffff",
+        )
+        style.configure("Treeview.Heading", borderwidth=1, relief="solid")
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -168,11 +179,13 @@ class PUtilsApp(tk.Tk):
     def _load_plugins(self) -> None:
         self.plugins = discover_plugins()
         self._refresh_dependencies()
+        self._add_settings_page()
         if not self.plugins:
             empty = ttk.Frame(self.plugin_notebook, padding=16)
             self.empty_plugin_label = ttk.Label(empty)
             self.empty_plugin_label.grid(row=0, column=0, sticky="w")
             self.plugin_notebook.add(empty, text=self.context.t("plugins.tab"))
+            self.empty_plugin_tab_index = self.plugin_notebook.index("end") - 1
         else:
             for plugin in self.plugins:
                 frame = ttk.Frame(self.plugin_notebook, padding=12)
@@ -183,7 +196,7 @@ class PUtilsApp(tk.Tk):
                     frame,
                     text=self.context.t(f"plugin.{plugin.metadata.plugin_id}.name", plugin.metadata.name),
                 )
-        self._add_settings_page()
+                self.plugin_tab_indices.append(self.plugin_notebook.index("end") - 1)
 
     def _add_settings_page(self) -> None:
         frame = ttk.Frame(self.plugin_notebook, padding=12)
@@ -280,13 +293,15 @@ class PUtilsApp(tk.Tk):
 
         if self.empty_plugin_label is not None:
             self.empty_plugin_label.configure(text=self.context.t("plugins.none"))
-            self.plugin_notebook.tab(0, text=self.context.t("plugins.tab"))
+            if self.empty_plugin_tab_index is not None:
+                self.plugin_notebook.tab(self.empty_plugin_tab_index, text=self.context.t("plugins.tab"))
 
         for index, plugin in enumerate(self.plugins):
-            self.plugin_notebook.tab(
-                index,
-                text=self.context.t(f"plugin.{plugin.metadata.plugin_id}.name", plugin.metadata.name),
-            )
+            if index < len(self.plugin_tab_indices):
+                self.plugin_notebook.tab(
+                    self.plugin_tab_indices[index],
+                    text=self.context.t(f"plugin.{plugin.metadata.plugin_id}.name", plugin.metadata.name),
+                )
         self._apply_settings_language()
         for panel in self.plugin_panels:
             language_setter = getattr(panel, "set_language", None)
