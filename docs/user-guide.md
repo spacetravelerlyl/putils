@@ -29,11 +29,14 @@ Open the `配置` / `Settings` tab to view and change application settings.
 Available settings:
 
 - Interface language.
+- Log timezone.
 - Database directory.
 - Current `config.sqlite3` path.
 - Current `logs.sqlite3` path.
 
-Changing the database directory takes effect after restarting the application. Existing database files are not moved automatically.
+Changing the database directory shows a migration button. Use it to copy the current `config.sqlite3` and `logs.sqlite3` files to the target directory. If files with the same names already exist in the target directory, they are backed up before being overwritten.
+
+The new database directory takes effect after restarting the application.
 
 If `PUTILS_DATA_DIR` is set in the environment, it overrides the configured database directory.
 
@@ -86,6 +89,12 @@ The lower panel shows recent operation logs. Logs include:
 - ffmpeg or processing errors.
 
 Click `Refresh` to reload the list immediately. The application also refreshes the panel periodically.
+
+Log timestamps are stored in UTC and displayed in the timezone selected in Settings. The display format is similar to:
+
+```text
+2026-05-06 15:30:00 CST
+```
 
 ## Stored Data
 

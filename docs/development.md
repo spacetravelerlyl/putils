@@ -75,6 +75,7 @@ The effective data directory is resolved in this order:
 The locator file is a small JSON file named `data_dir.json`. It is required because the application must know where `config.sqlite3` is before it can open the SQLite configuration database.
 
 Changing the database directory from the Settings page writes the locator file and takes effect after application restart. The application does not migrate existing database files automatically.
+When the database directory field differs from the active runtime directory, the Settings page shows a migration button. Migration copies `config.sqlite3` and `logs.sqlite3` to the target directory and backs up any existing target files with a `.bak.<timestamp>` suffix before overwriting.
 
 Configuration database:
 
@@ -159,6 +160,29 @@ key: language
 ```
 
 Language selection is managed from the Settings page. The language change is applied immediately and persisted to `config.sqlite3`.
+
+## Log Timezone
+
+Operation logs are stored in UTC by `LogStore`. The main window converts `created_at` values to the timezone configured in Settings when rendering the log table.
+
+The display format matches:
+
+```bash
+date "+%Y-%m-%d %H:%M:%S %Z"
+```
+
+Example:
+
+```text
+2026-05-06 15:30:00 CST
+```
+
+The configured timezone is stored in `config.sqlite3`:
+
+```text
+namespace: app
+key: timezone
+```
 
 ### Adding A Language
 

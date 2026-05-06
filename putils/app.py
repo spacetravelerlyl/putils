@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .database import ConfigStore, LogStore
 from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, Translator
@@ -13,6 +16,17 @@ from .plugin_loader import discover_plugins
 
 
 APP_CONFIG_NAMESPACE = "app"
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+SUPPORTED_TIMEZONES = (
+    "Asia/Shanghai",
+    "UTC",
+    "local",
+    "America/New_York",
+    "America/Los_Angeles",
+    "Europe/London",
+    "Europe/Berlin",
+    "Asia/Tokyo",
+)
 
 
 class AppContext:
@@ -43,6 +57,7 @@ class PUtilsApp(tk.Tk):
         self.config_store = ConfigStore(config_db_path())
         self.log_store = LogStore(log_db_path())
         language = str(self.config_store.get(APP_CONFIG_NAMESPACE, "language", DEFAULT_LANGUAGE))
+        self.display_timezone = str(self.config_store.get(APP_CONFIG_NAMESPACE, "timezone", DEFAULT_TIMEZONE))
         self.translator = Translator(language)
         self.context = AppContext(self.config_store, self.log_store, self.translator)
         self._log_refresh_after_id: str | None = None
@@ -53,6 +68,8 @@ class PUtilsApp(tk.Tk):
         self.settings_tab_index: int | None = None
         self.language_display_to_code: dict[str, str] = {}
         self.language_code_to_display: dict[str, str] = {}
+        self.current_data_dir = user_data_dir().resolve()
+        self.migrated_data_dir: Path | None = None
 
         self._configure_style()
         self._build_layout()
@@ -183,36 +200,54 @@ class PUtilsApp(tk.Tk):
         self.language_combo.grid(row=1, column=1, sticky="w", pady=(0, 8))
         self.language_combo.bind("<<ComboboxSelected>>", self._on_language_selected)
 
+        self.settings_timezone_label = ttk.Label(frame)
+        self.settings_timezone_label.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.timezone_var = tk.StringVar(value=self.display_timezone)
+        self.timezone_combo = ttk.Combobox(
+            frame,
+            textvariable=self.timezone_var,
+            values=SUPPORTED_TIMEZONES,
+            state="readonly",
+            width=24,
+        )
+        self.timezone_combo.grid(row=2, column=1, sticky="w", pady=(0, 8))
+        self.timezone_combo.bind("<<ComboboxSelected>>", self._on_timezone_selected)
+
         self.settings_data_dir_label = ttk.Label(frame)
-        self.settings_data_dir_label.grid(row=2, column=0, sticky="w", pady=(0, 8))
-        self.data_dir_var = tk.StringVar(value=str(user_data_dir()))
+        self.settings_data_dir_label.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.data_dir_var = tk.StringVar(value=str(self.current_data_dir))
         self.data_dir_entry = ttk.Entry(frame, textvariable=self.data_dir_var)
-        self.data_dir_entry.grid(row=2, column=1, sticky="ew", pady=(0, 8))
+        self.data_dir_entry.grid(row=3, column=1, sticky="ew", pady=(0, 8))
         self.data_dir_browse_button = ttk.Button(frame, command=self._choose_data_dir)
-        self.data_dir_browse_button.grid(row=2, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
+        self.data_dir_browse_button.grid(row=3, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
+        self.data_dir_var.trace_add("write", lambda *_args: self._update_migration_button())
 
         self.settings_config_db_label = ttk.Label(frame)
-        self.settings_config_db_label.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.settings_config_db_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
         self.config_db_var = tk.StringVar(value=str(config_db_path()))
         ttk.Entry(frame, textvariable=self.config_db_var, state="readonly").grid(
-            row=3, column=1, columnspan=2, sticky="ew", pady=(0, 8)
-        )
-
-        self.settings_log_db_label = ttk.Label(frame)
-        self.settings_log_db_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
-        self.log_db_var = tk.StringVar(value=str(log_db_path()))
-        ttk.Entry(frame, textvariable=self.log_db_var, state="readonly").grid(
             row=4, column=1, columnspan=2, sticky="ew", pady=(0, 8)
         )
 
+        self.settings_log_db_label = ttk.Label(frame)
+        self.settings_log_db_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
+        self.log_db_var = tk.StringVar(value=str(log_db_path()))
+        ttk.Entry(frame, textvariable=self.log_db_var, state="readonly").grid(
+            row=5, column=1, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+
         self.settings_hint_label = ttk.Label(frame, wraplength=720)
-        self.settings_hint_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        self.settings_hint_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 10))
 
         self.settings_save_button = ttk.Button(frame, command=self._save_settings)
-        self.settings_save_button.grid(row=6, column=1, sticky="w")
+        self.settings_save_button.grid(row=7, column=1, sticky="w")
+        self.settings_migrate_button = ttk.Button(frame, command=self._migrate_databases)
+        self.settings_migrate_button.grid(row=7, column=2, sticky="w", padx=(8, 0))
+        self.settings_migrate_button.grid_remove()
 
         self.plugin_notebook.add(frame, text=self.context.t("settings.tab"))
         self.settings_tab_index = self.plugin_notebook.index("end") - 1
+        self._update_migration_button()
 
     def _apply_language(self) -> None:
         self.title(self.context.t("app.title"))
@@ -271,11 +306,13 @@ class PUtilsApp(tk.Tk):
 
         self.settings_title_label.configure(text=self.context.t("settings.title"))
         self.settings_language_label.configure(text=self.context.t("settings.language"))
+        self.settings_timezone_label.configure(text=self.context.t("settings.timezone"))
         self.settings_data_dir_label.configure(text=self.context.t("settings.data_dir"))
         self.settings_config_db_label.configure(text=self.context.t("settings.config_db"))
         self.settings_log_db_label.configure(text=self.context.t("settings.log_db"))
         self.data_dir_browse_button.configure(text=self.context.t("settings.browse"))
         self.settings_save_button.configure(text=self.context.t("settings.save"))
+        self.settings_migrate_button.configure(text=self.context.t("settings.migrate"))
         hint = self.context.t("settings.restart_hint")
         if os.environ.get("PUTILS_DATA_DIR"):
             hint = f"{hint} {self.context.t('settings.env_override')}"
@@ -292,6 +329,15 @@ class PUtilsApp(tk.Tk):
         self.config_store.set(APP_CONFIG_NAMESPACE, "language", next_language)
         self._apply_language()
 
+    def _on_timezone_selected(self, _event=None) -> None:
+        selected = self.timezone_var.get()
+        if selected not in SUPPORTED_TIMEZONES:
+            selected = DEFAULT_TIMEZONE
+            self.timezone_var.set(selected)
+        self.display_timezone = selected
+        self.config_store.set(APP_CONFIG_NAMESPACE, "timezone", selected)
+        self._refresh_logs(schedule=False)
+
     def _choose_data_dir(self) -> None:
         selected = filedialog.askdirectory(
             title=self.context.t("settings.select_data_dir"),
@@ -300,9 +346,29 @@ class PUtilsApp(tk.Tk):
         if selected:
             self.data_dir_var.set(str(Path(selected).expanduser().resolve()))
 
+    def _target_data_dir(self) -> Path:
+        return Path(self.data_dir_var.get()).expanduser().resolve()
+
+    def _data_dir_changed(self) -> bool:
+        try:
+            target = self._target_data_dir()
+        except OSError:
+            return True
+        if target == self.current_data_dir:
+            return False
+        return target != self.migrated_data_dir
+
+    def _update_migration_button(self) -> None:
+        if not hasattr(self, "settings_migrate_button"):
+            return
+        if self._data_dir_changed():
+            self.settings_migrate_button.grid()
+        else:
+            self.settings_migrate_button.grid_remove()
+
     def _save_settings(self) -> None:
         try:
-            data_dir = Path(self.data_dir_var.get()).expanduser().resolve()
+            data_dir = self._target_data_dir()
             data_dir.mkdir(parents=True, exist_ok=True)
             write_configured_data_dir(data_dir)
             self.config_store.set(APP_CONFIG_NAMESPACE, "configured_data_dir", str(data_dir))
@@ -313,6 +379,62 @@ class PUtilsApp(tk.Tk):
             self.context.t("settings.saved.title"),
             self.context.t("settings.saved.message"),
         )
+        self._update_migration_button()
+
+    def _migrate_databases(self) -> None:
+        try:
+            target_dir = self._target_data_dir()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            self.config_store.set(APP_CONFIG_NAMESPACE, "configured_data_dir", str(target_dir))
+            migrated = self._copy_database_files(target_dir)
+            write_configured_data_dir(target_dir)
+        except Exception as exc:
+            messagebox.showerror(self.context.t("settings.error.title"), str(exc))
+            return
+        messagebox.showinfo(
+            self.context.t("settings.migrated.title"),
+            self.context.t("settings.migrated.message", count=migrated),
+        )
+        self.migrated_data_dir = target_dir
+        self._update_migration_button()
+
+    def _copy_database_files(self, target_dir: Path) -> int:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        migrated = 0
+        for source in (config_db_path(), log_db_path()):
+            if not source.exists():
+                continue
+            target = target_dir / source.name
+            if source.resolve() == target.resolve():
+                continue
+            if target.exists():
+                backup = target.with_name(f"{target.name}.bak.{timestamp}")
+                shutil.copy2(target, backup)
+            shutil.copy2(source, target)
+            migrated += 1
+        return migrated
+
+    def _format_log_time(self, created_at: str) -> str:
+        try:
+            dt = datetime.fromisoformat(created_at)
+        except ValueError:
+            return created_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        target_timezone = self._selected_tzinfo()
+        return dt.astimezone(target_timezone).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    def _selected_tzinfo(self):
+        if self.display_timezone == "local":
+            return datetime.now().astimezone().tzinfo
+        try:
+            return ZoneInfo(self.display_timezone)
+        except ZoneInfoNotFoundError:
+            fallback_offsets = {
+                "Asia/Shanghai": timezone(timedelta(hours=8), "CST"),
+                "UTC": timezone.utc,
+            }
+            return fallback_offsets.get(self.display_timezone, timezone.utc)
 
     def _refresh_dependencies(self) -> None:
         for item in self.dependency_tree.get_children():
@@ -387,7 +509,7 @@ class PUtilsApp(tk.Tk):
             self.log_tree.insert(
                 "",
                 tk.END,
-                values=(row["created_at"], row["plugin_id"], row["level"], row["message"]),
+                values=(self._format_log_time(row["created_at"]), row["plugin_id"], row["level"], row["message"]),
             )
         if schedule:
             if self._log_refresh_after_id is not None:
