@@ -66,8 +66,9 @@ class ConfigStore:
 
 
 class LogStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, retention_limit: int | None = None) -> None:
         self.db_path = db_path
+        self.retention_limit = retention_limit
         self._init_db()
 
     @contextmanager
@@ -100,6 +101,33 @@ class LogStore:
                 ON operation_logs(created_at)
                 """
             )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_operation_logs_id
+                ON operation_logs(id)
+                """
+            )
+
+    def set_retention_limit(self, retention_limit: int | None) -> None:
+        self.retention_limit = retention_limit
+
+    def rotate(self, retention_limit: int | None = None) -> int:
+        limit = self.retention_limit if retention_limit is None else retention_limit
+        if limit is None or limit < 1:
+            return 0
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM operation_logs
+                ORDER BY id DESC
+                LIMIT 1 OFFSET ?
+                """,
+                (limit - 1,),
+            ).fetchone()
+            if row is None:
+                return 0
+            cursor = conn.execute("DELETE FROM operation_logs WHERE id < ?", (row["id"],))
+            return cursor.rowcount
 
     def add(self, plugin_id: str, level: str, message: str, details: dict[str, Any] | None = None) -> None:
         with self.connect() as conn:
@@ -116,6 +144,7 @@ class LogStore:
                     json.dumps(details, ensure_ascii=False) if details else None,
                 ),
             )
+        self.rotate()
 
     def recent(self, limit: int = 200) -> list[sqlite3.Row]:
         with self.connect() as conn:
@@ -130,4 +159,3 @@ class LogStore:
                     (limit,),
                 ).fetchall()
             )
-

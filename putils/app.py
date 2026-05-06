@@ -10,13 +10,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .database import ConfigStore, LogStore
 from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, Translator
-from .paths import config_db_path, log_db_path, user_data_dir, write_configured_data_dir
+from .paths import config_db_path, default_user_data_dir, log_db_path, user_data_dir, write_configured_data_dir
 from .plugin_api import DependencyStatus
 from .plugin_loader import discover_plugins
 
 
 APP_CONFIG_NAMESPACE = "app"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_LOG_RETENTION_LIMIT = 1_000_000
 SUPPORTED_TIMEZONES = (
     "Asia/Shanghai",
     "UTC",
@@ -55,9 +56,11 @@ class PUtilsApp(tk.Tk):
         self.minsize(860, 560)
 
         self.config_store = ConfigStore(config_db_path())
-        self.log_store = LogStore(log_db_path())
         language = str(self.config_store.get(APP_CONFIG_NAMESPACE, "language", DEFAULT_LANGUAGE))
         self.display_timezone = str(self.config_store.get(APP_CONFIG_NAMESPACE, "timezone", DEFAULT_TIMEZONE))
+        self.log_retention_limit = self._configured_log_retention_limit()
+        self.log_store = LogStore(log_db_path(), self.log_retention_limit)
+        self.log_store.rotate()
         self.translator = Translator(language)
         self.context = AppContext(self.config_store, self.log_store, self.translator)
         self._log_refresh_after_id: str | None = None
@@ -226,37 +229,52 @@ class PUtilsApp(tk.Tk):
         self.timezone_combo.grid(row=2, column=1, sticky="w", pady=(0, 8))
         self.timezone_combo.bind("<<ComboboxSelected>>", self._on_timezone_selected)
 
+        self.settings_log_retention_label = ttk.Label(frame)
+        self.settings_log_retention_label.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.log_retention_var = tk.StringVar(value=str(self.log_retention_limit))
+        self.log_retention_spinbox = ttk.Spinbox(
+            frame,
+            textvariable=self.log_retention_var,
+            from_=1,
+            to=100_000_000,
+            increment=1000,
+            width=18,
+        )
+        self.log_retention_spinbox.grid(row=3, column=1, sticky="w", pady=(0, 8))
+
         self.settings_data_dir_label = ttk.Label(frame)
-        self.settings_data_dir_label.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.settings_data_dir_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
         self.data_dir_var = tk.StringVar(value=str(self.current_data_dir))
         self.data_dir_entry = ttk.Entry(frame, textvariable=self.data_dir_var)
-        self.data_dir_entry.grid(row=3, column=1, sticky="ew", pady=(0, 8))
+        self.data_dir_entry.grid(row=4, column=1, sticky="ew", pady=(0, 8))
         self.data_dir_browse_button = ttk.Button(frame, command=self._choose_data_dir)
-        self.data_dir_browse_button.grid(row=3, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
+        self.data_dir_browse_button.grid(row=4, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
         self.data_dir_var.trace_add("write", lambda *_args: self._update_migration_button())
 
         self.settings_config_db_label = ttk.Label(frame)
-        self.settings_config_db_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
+        self.settings_config_db_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
         self.config_db_var = tk.StringVar(value=str(config_db_path()))
         ttk.Entry(frame, textvariable=self.config_db_var, state="readonly").grid(
-            row=4, column=1, columnspan=2, sticky="ew", pady=(0, 8)
-        )
-
-        self.settings_log_db_label = ttk.Label(frame)
-        self.settings_log_db_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
-        self.log_db_var = tk.StringVar(value=str(log_db_path()))
-        ttk.Entry(frame, textvariable=self.log_db_var, state="readonly").grid(
             row=5, column=1, columnspan=2, sticky="ew", pady=(0, 8)
         )
 
+        self.settings_log_db_label = ttk.Label(frame)
+        self.settings_log_db_label.grid(row=6, column=0, sticky="w", pady=(0, 8))
+        self.log_db_var = tk.StringVar(value=str(log_db_path()))
+        ttk.Entry(frame, textvariable=self.log_db_var, state="readonly").grid(
+            row=6, column=1, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+
         self.settings_hint_label = ttk.Label(frame, wraplength=720)
-        self.settings_hint_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        self.settings_hint_label.grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 10))
 
         self.settings_save_button = ttk.Button(frame, command=self._save_settings)
-        self.settings_save_button.grid(row=7, column=1, sticky="w")
+        self.settings_save_button.grid(row=8, column=1, sticky="w")
         self.settings_migrate_button = ttk.Button(frame, command=self._migrate_databases)
-        self.settings_migrate_button.grid(row=7, column=2, sticky="w", padx=(8, 0))
+        self.settings_migrate_button.grid(row=8, column=2, sticky="w", padx=(8, 0))
         self.settings_migrate_button.grid_remove()
+        self.settings_restore_defaults_button = ttk.Button(frame, command=self._restore_default_settings)
+        self.settings_restore_defaults_button.grid(row=9, column=1, sticky="w", pady=(8, 0))
 
         self.plugin_notebook.add(frame, text=self.context.t("settings.tab"))
         self.settings_tab_index = self.plugin_notebook.index("end") - 1
@@ -322,12 +340,14 @@ class PUtilsApp(tk.Tk):
         self.settings_title_label.configure(text=self.context.t("settings.title"))
         self.settings_language_label.configure(text=self.context.t("settings.language"))
         self.settings_timezone_label.configure(text=self.context.t("settings.timezone"))
+        self.settings_log_retention_label.configure(text=self.context.t("settings.log_retention"))
         self.settings_data_dir_label.configure(text=self.context.t("settings.data_dir"))
         self.settings_config_db_label.configure(text=self.context.t("settings.config_db"))
         self.settings_log_db_label.configure(text=self.context.t("settings.log_db"))
         self.data_dir_browse_button.configure(text=self.context.t("settings.browse"))
         self.settings_save_button.configure(text=self.context.t("settings.save"))
         self.settings_migrate_button.configure(text=self.context.t("settings.migrate"))
+        self.settings_restore_defaults_button.configure(text=self.context.t("settings.restore_defaults"))
         hint = self.context.t("settings.restart_hint")
         if os.environ.get("PUTILS_DATA_DIR"):
             hint = f"{hint} {self.context.t('settings.env_override')}"
@@ -352,6 +372,28 @@ class PUtilsApp(tk.Tk):
         self.display_timezone = selected
         self.config_store.set(APP_CONFIG_NAMESPACE, "timezone", selected)
         self._refresh_logs(schedule=False)
+
+    def _configured_log_retention_limit(self) -> int:
+        value = self.config_store.get(
+            APP_CONFIG_NAMESPACE,
+            "log_retention_limit",
+            DEFAULT_LOG_RETENTION_LIMIT,
+        )
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_LOG_RETENTION_LIMIT
+        return max(1, limit)
+
+    def _selected_log_retention_limit(self) -> int:
+        value = self.log_retention_var.get().strip().replace(",", "")
+        try:
+            limit = int(value)
+        except ValueError as exc:
+            raise ValueError(self.context.t("settings.log_retention.invalid")) from exc
+        if limit < 1:
+            raise ValueError(self.context.t("settings.log_retention.invalid"))
+        return limit
 
     def _choose_data_dir(self) -> None:
         selected = filedialog.askdirectory(
@@ -384,9 +426,15 @@ class PUtilsApp(tk.Tk):
     def _save_settings(self) -> None:
         try:
             data_dir = self._target_data_dir()
+            log_retention_limit = self._selected_log_retention_limit()
             data_dir.mkdir(parents=True, exist_ok=True)
             write_configured_data_dir(data_dir)
             self.config_store.set(APP_CONFIG_NAMESPACE, "configured_data_dir", str(data_dir))
+            self.config_store.set(APP_CONFIG_NAMESPACE, "log_retention_limit", log_retention_limit)
+            self.log_retention_limit = log_retention_limit
+            self.log_retention_var.set(str(log_retention_limit))
+            self.log_store.set_retention_limit(log_retention_limit)
+            self.log_store.rotate()
         except Exception as exc:
             messagebox.showerror(self.context.t("settings.error.title"), str(exc))
             return
@@ -395,6 +443,46 @@ class PUtilsApp(tk.Tk):
             self.context.t("settings.saved.message"),
         )
         self._update_migration_button()
+        self._refresh_logs(schedule=False)
+
+    def _restore_default_settings(self) -> None:
+        for step in range(1, 4):
+            confirmed = messagebox.askyesno(
+                self.context.t("settings.restore_defaults.confirm.title", step=step),
+                self.context.t("settings.restore_defaults.confirm.message", step=step),
+                parent=self,
+            )
+            if not confirmed:
+                return
+
+        default_data_dir = default_user_data_dir().resolve()
+        try:
+            default_data_dir.mkdir(parents=True, exist_ok=True)
+            write_configured_data_dir(default_data_dir)
+            self.config_store.set(APP_CONFIG_NAMESPACE, "language", DEFAULT_LANGUAGE)
+            self.config_store.set(APP_CONFIG_NAMESPACE, "timezone", DEFAULT_TIMEZONE)
+            self.config_store.set(APP_CONFIG_NAMESPACE, "configured_data_dir", str(default_data_dir))
+            self.config_store.set(APP_CONFIG_NAMESPACE, "log_retention_limit", DEFAULT_LOG_RETENTION_LIMIT)
+            self.translator.set_language(DEFAULT_LANGUAGE)
+            self.display_timezone = DEFAULT_TIMEZONE
+            self.log_retention_limit = DEFAULT_LOG_RETENTION_LIMIT
+            self.log_store.set_retention_limit(DEFAULT_LOG_RETENTION_LIMIT)
+            self.log_store.rotate()
+        except Exception as exc:
+            messagebox.showerror(self.context.t("settings.error.title"), str(exc))
+            return
+
+        self.timezone_var.set(DEFAULT_TIMEZONE)
+        self.log_retention_var.set(str(DEFAULT_LOG_RETENTION_LIMIT))
+        self.data_dir_var.set(str(default_data_dir))
+        self.migrated_data_dir = None
+        self._apply_language()
+        self._update_migration_button()
+        self._refresh_logs(schedule=False)
+        messagebox.showinfo(
+            self.context.t("settings.restored.title"),
+            self.context.t("settings.restored.message"),
+        )
 
     def _migrate_databases(self) -> None:
         try:
