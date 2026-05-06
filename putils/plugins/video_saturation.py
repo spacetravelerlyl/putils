@@ -3,7 +3,6 @@ from __future__ import annotations
 import shutil
 import subprocess
 import threading
-import json
 from functools import partial
 from pathlib import Path
 import tkinter as tk
@@ -117,6 +116,8 @@ class VideoSaturationPanel(ttk.Frame):
         self.progress_fill = None
         self.progress_label_window = None
         self.progress_color = "#9ca3af"
+        self.preview_process: subprocess.Popen | None = None
+        self.preview_control_window: tk.Toplevel | None = None
 
         self.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
@@ -441,21 +442,34 @@ class VideoSaturationPanel(ttk.Frame):
             )
             return
         input_path, output_path = pair
-        for title_key, path in (
-            ("video_saturation.preview.original", input_path),
-            ("video_saturation.preview.converted", output_path),
-        ):
-            subprocess.Popen(
-                [
-                    ffplay_path,
-                    "-autoexit",
-                    "-window_title",
-                    f"{self.context.t(title_key)} - {path.name}",
-                    str(path),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        self._close_preview()
+        filter_complex = (
+            "[0:v]setpts=PTS-STARTPTS,scale=-2:540,"
+            "pad=iw+8:ih+8:4:4:color=white[left];"
+            "[1:v]setpts=PTS-STARTPTS,scale=-2:540,"
+            "pad=iw+8:ih+8:4:4:color=white[right];"
+            "[left][right]hstack=inputs=2:shortest=1[v]"
+        )
+        self.preview_process = subprocess.Popen(
+            [
+                ffplay_path,
+                "-autoexit",
+                "-an",
+                "-window_title",
+                self.context.t("video_saturation.preview.window_title"),
+                "-i",
+                str(input_path),
+                "-i",
+                str(output_path),
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[v]",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._open_preview_control_window(input_path, output_path)
 
     def _compare_video_info(self) -> None:
         pair = self._selected_completed_pair()
@@ -482,20 +496,43 @@ class VideoSaturationPanel(ttk.Frame):
         self._show_video_info_window(input_path, output_path, original, converted)
 
     def _probe_video(self, ffprobe_path: str, path: Path) -> dict[str, str]:
+        format_info = self._ffprobe_key_values(
+            ffprobe_path,
+            path,
+            ["-show_entries", "format=duration,bit_rate"],
+        )
+        video_info = self._ffprobe_key_values(
+            ffprobe_path,
+            path,
+            ["-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate"],
+        )
+        audio_codecs = self._ffprobe_values(
+            ffprobe_path,
+            path,
+            ["-select_streams", "a", "-show_entries", "stream=codec_name"],
+            "codec_name",
+        )
+        video_rate = video_info.get("avg_frame_rate") or video_info.get("r_frame_rate") or ""
+        return {
+            "file": path.name,
+            "size": self._format_bytes(path.stat().st_size),
+            "duration": self._format_duration(format_info.get("duration", "")),
+            "bitrate": self._format_bitrate(format_info.get("bit_rate", "")),
+            "video_codec": video_info.get("codec_name", "") or "-",
+            "resolution": self._format_resolution(video_info),
+            "frame_rate": self._format_frame_rate(str(video_rate)),
+            "audio": ", ".join(audio_codecs) or "-",
+        }
+
+    def _ffprobe_key_values(self, ffprobe_path: str, path: Path, extra_args: list[str]) -> dict[str, str]:
         result = subprocess.run(
             [
                 ffprobe_path,
                 "-v",
                 "error",
-                "-print_format",
-                "json",
-                "-show_entries",
-                (
-                    "format=duration,bit_rate:"
-                    "stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate"
-                ),
-                "-show_format",
-                "-show_streams",
+                *extra_args,
+                "-of",
+                "default=noprint_wrappers=1:nokey=0",
                 str(path),
             ],
             check=True,
@@ -503,20 +540,38 @@ class VideoSaturationPanel(ttk.Frame):
             text=True,
             timeout=15,
         )
-        data = json.loads(result.stdout)
-        video_stream = next((stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"), {})
-        audio_streams = [stream for stream in data.get("streams", []) if stream.get("codec_type") == "audio"]
-        video_rate = video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or ""
-        return {
-            "file": path.name,
-            "size": self._format_bytes(path.stat().st_size),
-            "duration": self._format_duration(data.get("format", {}).get("duration", "")),
-            "bitrate": self._format_bitrate(data.get("format", {}).get("bit_rate", "")),
-            "video_codec": str(video_stream.get("codec_name", "")),
-            "resolution": self._format_resolution(video_stream),
-            "frame_rate": self._format_frame_rate(str(video_rate)),
-            "audio": ", ".join(str(stream.get("codec_name", "")) for stream in audio_streams) or "-",
-        }
+        values: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+        return values
+
+    def _ffprobe_values(self, ffprobe_path: str, path: Path, extra_args: list[str], key_name: str) -> list[str]:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                *extra_args,
+                "-of",
+                "default=noprint_wrappers=1:nokey=0",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        values: list[str] = []
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == key_name and value.strip():
+                values.append(value.strip())
+        return values
 
     def _show_video_info_window(
         self,
@@ -560,6 +615,55 @@ class VideoSaturationPanel(ttk.Frame):
             lines.append(f"{self.context.t(label_key):<18}{original[key]:<28}{converted[key]}")
         text.insert("1.0", "\n".join(lines))
         text.configure(state=tk.DISABLED)
+
+    def _open_preview_control_window(self, input_path: Path, output_path: Path) -> None:
+        window = tk.Toplevel(self)
+        window.title(self.context.t("video_saturation.preview.control_title"))
+        window.geometry("520x160")
+        window.resizable(False, False)
+        window.columnconfigure(0, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self._close_preview)
+
+        frame = ttk.Frame(window, padding=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+
+        ttk.Label(frame, text=self.context.t("video_saturation.preview.window_title")).grid(
+            row=0, column=0, sticky="w", pady=(0, 10)
+        )
+        ttk.Label(
+            frame,
+            text=f"{self.context.t('video_saturation.preview.original')}: {input_path.name}",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(
+            frame,
+            text=f"{self.context.t('video_saturation.preview.converted')}: {output_path.name}",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 12))
+        ttk.Button(
+            frame,
+            text=self.context.t("video_saturation.preview.close"),
+            command=self._close_preview,
+        ).grid(row=3, column=0, sticky="w")
+
+        self.preview_control_window = window
+        self._poll_preview_process()
+
+    def _poll_preview_process(self) -> None:
+        if self.preview_process is None:
+            return
+        if self.preview_process.poll() is not None:
+            self._close_preview(destroy_process=False)
+            return
+        if self.preview_control_window is not None and self.preview_control_window.winfo_exists():
+            self.after(500, self._poll_preview_process)
+
+    def _close_preview(self, destroy_process: bool = True) -> None:
+        if destroy_process and self.preview_process is not None and self.preview_process.poll() is None:
+            self.preview_process.terminate()
+        self.preview_process = None
+        if self.preview_control_window is not None and self.preview_control_window.winfo_exists():
+            self.preview_control_window.destroy()
+        self.preview_control_window = None
 
     def _format_bytes(self, size: int) -> str:
         value = float(size)
