@@ -17,6 +17,7 @@ VIDEO_FILE_TYPES = (
     ("video_saturation.file_types.video", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
     ("video_saturation.file_types.all", "*.*"),
 )
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 
 class VideoSaturationPlugin:
@@ -103,6 +104,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.files: list[Path] = []
         self.item_status_keys: dict[str, str] = {}
         self.output_paths: dict[str, Path] = {}
+        self.source_directories: dict[str, Path] = {}
         self.output_dir = tk.StringVar(value=str(context.get_config(CONFIG_NAMESPACE, "output_dir", "")))
         self.saturation = tk.DoubleVar(value=float(context.get_config(CONFIG_NAMESPACE, "saturation", 0.7)))
         self.status = tk.StringVar(value=context.t("video_saturation.ready"))
@@ -159,11 +161,13 @@ class VideoSaturationPanel(ttk.Frame):
         actions.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.add_button = ttk.Button(actions, command=self._add_files)
         self.add_button.grid(row=0, column=0, padx=(0, 6))
+        self.add_directory_button = ttk.Button(actions, command=self._add_directory)
+        self.add_directory_button.grid(row=0, column=1, padx=(0, 6))
         self.clear_button = ttk.Button(actions, command=self._clear_files)
-        self.clear_button.grid(row=0, column=1, padx=(0, 6))
+        self.clear_button.grid(row=0, column=2, padx=(0, 6))
         self.run_button = ttk.Button(actions, command=self._run)
-        self.run_button.grid(row=0, column=2)
-        ttk.Label(actions, textvariable=self.status).grid(row=0, column=3, sticky="w", padx=(12, 0))
+        self.run_button.grid(row=0, column=3)
+        ttk.Label(actions, textvariable=self.status).grid(row=0, column=4, sticky="w", padx=(12, 0))
 
         progress_frame = ttk.Frame(self)
         progress_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -218,18 +222,45 @@ class VideoSaturationPanel(ttk.Frame):
             title=self.context.t("video_saturation.select_videos"),
             filetypes=file_types,
         )
-        existing = {path.resolve() for path in self.files}
-        for file_name in selected:
-            path = Path(file_name).resolve()
-            if path in existing:
-                continue
-            self.files.append(path)
-            existing.add(path)
-            self.output_paths.pop(str(path), None)
-            self.file_tree.insert(
-                "", tk.END, iid=str(path), values=(str(path), self.context.t("video_saturation.pending"))
+        self._add_paths((Path(file_name).resolve() for file_name in selected))
+
+    def _add_directory(self) -> None:
+        selected = filedialog.askdirectory(title=self.context.t("video_saturation.select_directory"))
+        if not selected:
+            return
+        directory = Path(selected).resolve()
+        videos = sorted(
+            path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
+        )
+        if not videos:
+            messagebox.showinfo(
+                self.context.t("video_saturation.no_directory_videos.title"),
+                self.context.t("video_saturation.no_directory_videos.message", directory=directory),
             )
-            self.item_status_keys[str(path)] = "video_saturation.pending"
+            return
+        self._add_paths(videos, source_directory=directory)
+
+    def _add_paths(self, paths, source_directory: Path | None = None) -> None:
+        existing = {path.resolve() for path in self.files}
+        for path in paths:
+            resolved = path.resolve()
+            if resolved in existing:
+                continue
+            self.files.append(resolved)
+            existing.add(resolved)
+            item_id = str(resolved)
+            self.output_paths.pop(item_id, None)
+            if source_directory is not None:
+                self.source_directories[item_id] = source_directory
+            else:
+                self.source_directories.pop(item_id, None)
+            self.file_tree.insert(
+                "",
+                tk.END,
+                iid=item_id,
+                values=(str(resolved), self.context.t("video_saturation.pending")),
+            )
+            self.item_status_keys[item_id] = "video_saturation.pending"
         self._set_status("video_saturation.selected", count=len(self.files))
 
     def _clear_files(self) -> None:
@@ -240,6 +271,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.files.clear()
         self.item_status_keys.clear()
         self.output_paths.clear()
+        self.source_directories.clear()
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
         self.progress.set(0)
@@ -360,7 +392,16 @@ class VideoSaturationPanel(ttk.Frame):
         self.after(0, self._finish_run, completed, total, generation)
 
     def _output_path_for(self, input_path: Path, output_dir: str) -> Path:
-        directory = Path(output_dir).expanduser() if output_dir else input_path.parent
+        source_directory = self.source_directories.get(str(input_path))
+        if source_directory is not None:
+            target_root = (
+                Path(output_dir).expanduser().resolve()
+                if output_dir
+                else source_directory.parent
+            )
+            directory = target_root / f"{source_directory.name}_saturation_adjusted"
+        else:
+            directory = Path(output_dir).expanduser().resolve() if output_dir else input_path.parent
         return directory / f"{input_path.stem}_saturation_adjusted{input_path.suffix}"
 
     def _set_item_status(self, input_path: Path, status_key: str, generation: int | None = None) -> None:
@@ -765,6 +806,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.output_dir_label.configure(text=self.context.t("video_saturation.output_directory"))
         self.browse_button.configure(text=self.context.t("video_saturation.browse"))
         self.add_button.configure(text=self.context.t("video_saturation.add_videos"))
+        self.add_directory_button.configure(text=self.context.t("video_saturation.add_directory"))
         self.clear_button.configure(text=self.context.t("video_saturation.clear"))
         self.run_button.configure(text=self.context.t("video_saturation.run"))
         self.progress_label.configure(text=self.context.t("video_saturation.progress"))
