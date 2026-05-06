@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
 import tkinter as tk
@@ -13,6 +15,7 @@ from putils.plugin_api import DependencyStatus, PluginMetadata
 
 PLUGIN_ID = "video_saturation"
 CONFIG_NAMESPACE = "plugin.video_saturation"
+DEFAULT_PARALLELISM = max(1, min(4, os.cpu_count() or 1))
 VIDEO_FILE_TYPES = (
     ("video_saturation.file_types.video", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
     ("video_saturation.file_types.all", "*.*"),
@@ -107,6 +110,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.source_directories: dict[str, Path] = {}
         self.output_dir = tk.StringVar(value=str(context.get_config(CONFIG_NAMESPACE, "output_dir", "")))
         self.saturation = tk.DoubleVar(value=float(context.get_config(CONFIG_NAMESPACE, "saturation", 0.7)))
+        self.parallelism = tk.IntVar(value=self._configured_parallelism())
         self.status = tk.StringVar(value=context.t("video_saturation.ready"))
         self.status_key = "video_saturation.ready"
         self.status_kwargs: dict[str, object] = {}
@@ -114,12 +118,30 @@ class VideoSaturationPanel(ttk.Frame):
         self.progress_text = tk.StringVar(value="0%")
         self.running = False
         self.worker_thread: threading.Thread | None = None
+        self.cancel_event = threading.Event()
+        self.process_lock = threading.Lock()
+        self.active_processes: set[subprocess.Popen] = set()
         self.run_generation = 0
         self.progress_fill = None
         self.progress_label_window = None
         self.progress_color = "#9ca3af"
         self.preview_process: subprocess.Popen | None = None
         self.preview_control_window: tk.Toplevel | None = None
+        self.gpu_info = self._detect_gpu_info()
+        self.gpu_available = bool(self.gpu_info["available"])
+        self.gpu_modes: list[str] = ["off", *list(self.gpu_info.get("hwaccels", []))]
+        saved_gpu_mode = str(context.get_config(CONFIG_NAMESPACE, "gpu_mode", "off"))
+        if saved_gpu_mode not in self.gpu_modes:
+            saved_gpu_mode = self.gpu_modes[1] if self.gpu_available and len(self.gpu_modes) > 1 else "off"
+        self.gpu_mode = tk.StringVar(value=saved_gpu_mode)
+        self.gpu_devices: list[dict[str, str]] = list(self.gpu_info.get("devices", []))
+        self.gpu_device_labels = [device["label"] for device in self.gpu_devices] or [self.context.t("video_saturation.gpu.device.none")]
+        saved_gpu_device = str(context.get_config(CONFIG_NAMESPACE, "gpu_device", ""))
+        default_device = self.gpu_device_labels[0]
+        if saved_gpu_device and saved_gpu_device in self.gpu_device_labels:
+            default_device = saved_gpu_device
+        self.gpu_device = tk.StringVar(value=default_device)
+        self.gpu_status_text = tk.StringVar()
 
         self.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
@@ -157,6 +179,31 @@ class VideoSaturationPanel(ttk.Frame):
             row=1, column=2, sticky="e", padx=(8, 0), pady=(8, 0)
         )
 
+        self.parallelism_label = ttk.Label(controls)
+        self.parallelism_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.parallelism_spinbox = ttk.Spinbox(
+            controls,
+            textvariable=self.parallelism,
+            from_=1,
+            to=max(1, os.cpu_count() or 1),
+            width=8,
+        )
+        self.parallelism_spinbox.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        self.gpu_label = ttk.Label(controls)
+        self.gpu_label.grid(row=3, column=0, sticky="nw", pady=(8, 0))
+        self.gpu_status_label = ttk.Label(controls, textvariable=self.gpu_status_text, wraplength=520, justify="left")
+        self.gpu_status_label.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.gpu_mode_label = ttk.Label(controls)
+        self.gpu_mode_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.gpu_mode_combo = ttk.Combobox(controls, textvariable=self.gpu_mode, state="readonly", width=18)
+        self.gpu_mode_combo.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        self.gpu_device_label = ttk.Label(controls)
+        self.gpu_device_label.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self.gpu_device_combo = ttk.Combobox(controls, textvariable=self.gpu_device, state="readonly", width=40)
+        self.gpu_device_combo.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
         actions = ttk.Frame(self)
         actions.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.add_button = ttk.Button(actions, command=self._add_files)
@@ -167,7 +214,10 @@ class VideoSaturationPanel(ttk.Frame):
         self.clear_button.grid(row=0, column=2, padx=(0, 6))
         self.run_button = ttk.Button(actions, command=self._run)
         self.run_button.grid(row=0, column=3)
-        ttk.Label(actions, textvariable=self.status).grid(row=0, column=4, sticky="w", padx=(12, 0))
+        self.stop_button = ttk.Button(actions, command=self._stop_run)
+        self.stop_button.grid(row=0, column=4, padx=(6, 0))
+        self.stop_button.configure(state=tk.DISABLED)
+        ttk.Label(actions, textvariable=self.status).grid(row=0, column=5, sticky="w", padx=(12, 0))
 
         progress_frame = ttk.Frame(self)
         progress_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -209,6 +259,122 @@ class VideoSaturationPanel(ttk.Frame):
         value = round(float(self.saturation.get()), 2)
         self.ratio_label.configure(text=f"{value:.2f}")
         self.context.set_config(CONFIG_NAMESPACE, "saturation", value)
+
+    def _configured_parallelism(self) -> int:
+        value = self.context.get_config(CONFIG_NAMESPACE, "parallelism", DEFAULT_PARALLELISM)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_PARALLELISM
+        return max(1, parsed)
+
+    def _selected_parallelism(self) -> int:
+        try:
+            value = int(str(self.parallelism.get()).strip())
+        except (tk.TclError, TypeError, ValueError) as exc:
+            raise ValueError(self.context.t("video_saturation.parallelism.invalid")) from exc
+        if value < 1:
+            raise ValueError(self.context.t("video_saturation.parallelism.invalid"))
+        return value
+
+    def _detect_gpu_info(self) -> dict[str, object]:
+        ffmpeg_path = shutil.which("ffmpeg")
+        hwaccels: list[str] = []
+        if ffmpeg_path:
+            try:
+                result = subprocess.run(
+                    [ffmpeg_path, "-hide_banner", "-hwaccels"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                hwaccels = [
+                    line.strip()
+                    for line in result.stdout.splitlines()
+                    if line.strip() and not line.lower().startswith("hardware acceleration")
+                ]
+            except Exception:
+                hwaccels = []
+
+        if shutil.which("nvidia-smi"):
+            try:
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=name,driver_version,memory.total",
+                        "--format=csv,noheader",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                gpus = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                if gpus:
+                    devices = [
+                        {"label": f"GPU {index}: {line}", "value": str(index)}
+                        for index, line in enumerate(gpus)
+                    ]
+                    return {
+                        "available": True,
+                        "summary": "; ".join(gpus),
+                        "hwaccel": "cuda" if "cuda" in hwaccels else "auto",
+                        "hwaccels": hwaccels,
+                        "devices": devices,
+                    }
+            except Exception:
+                pass
+
+        if shutil.which("lspci"):
+            try:
+                result = subprocess.run(
+                    ["lspci"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                matches = [
+                    line.strip()
+                    for line in result.stdout.splitlines()
+                    if any(token in line.lower() for token in ("vga", "3d controller", "display controller"))
+                ]
+                if matches and hwaccels:
+                    return {
+                        "available": True,
+                        "summary": "; ".join(matches[:2]),
+                        "hwaccel": "auto",
+                        "hwaccels": hwaccels,
+                        "devices": [],
+                    }
+            except Exception:
+                pass
+
+        if hwaccels:
+            return {
+                "available": True,
+                "summary": self.context.t("video_saturation.gpu.detected_hwaccels", values=", ".join(hwaccels)),
+                "hwaccel": "auto",
+                "hwaccels": hwaccels,
+                "devices": [],
+            }
+
+        return {
+            "available": False,
+            "summary": self.context.t("video_saturation.gpu.not_found"),
+            "hwaccel": None,
+            "hwaccels": [],
+            "devices": [],
+        }
+
+    def _gpu_status_display_text(self) -> str:
+        summary = str(self.gpu_info.get("summary", "")).strip()
+        hwaccels = self.gpu_info.get("hwaccels", [])
+        if hwaccels:
+            accel_text = self.context.t("video_saturation.gpu.hwaccels", values=", ".join(hwaccels))
+            return f"{summary}\n{accel_text}" if summary else accel_text
+        return summary
 
     def _choose_output_dir(self) -> None:
         selected = filedialog.askdirectory(title=self.context.t("video_saturation.select_output_dir"))
@@ -299,11 +465,23 @@ class VideoSaturationPanel(ttk.Frame):
 
         output_dir = self.output_dir.get().strip()
         files = list(self.files)
+        try:
+            parallelism = self._selected_parallelism()
+        except ValueError as exc:
+            messagebox.showerror(self.context.t("video_saturation.invalid_settings.title"), str(exc))
+            return
+        gpu_mode = self._selected_gpu_mode()
+        gpu_device = self._selected_gpu_device()
         self.run_generation += 1
         generation = self.run_generation
+        self.cancel_event.clear()
         self.context.set_config(CONFIG_NAMESPACE, "output_dir", output_dir)
+        self.context.set_config(CONFIG_NAMESPACE, "parallelism", parallelism)
+        self.context.set_config(CONFIG_NAMESPACE, "gpu_mode", gpu_mode)
+        self.context.set_config(CONFIG_NAMESPACE, "gpu_device", gpu_device)
         self.running = True
         self.run_button.configure(state=tk.DISABLED)
+        self.stop_button.configure(state=tk.NORMAL)
         self.progress.set(0)
         self.progress_text.set("0%")
         self._redraw_progress("#2563eb")
@@ -311,7 +489,7 @@ class VideoSaturationPanel(ttk.Frame):
         saturation = round(float(self.saturation.get()), 2)
         self.worker_thread = threading.Thread(
             target=self._run_worker,
-            args=(ffmpeg_path, saturation, output_dir, files, generation),
+            args=(ffmpeg_path, saturation, output_dir, files, generation, parallelism, gpu_mode, gpu_device),
             daemon=True,
         )
         self.worker_thread.start()
@@ -323,17 +501,105 @@ class VideoSaturationPanel(ttk.Frame):
         output_dir: str,
         files: list[Path],
         generation: int,
+        parallelism: int,
+        gpu_mode: str,
+        gpu_device: str,
     ) -> None:
         total = len(files)
         completed = 0
         processed = 0
-        for input_path in files:
-            self._set_item_status(input_path, "video_saturation.running", generation)
-            output_path = self._output_path_for(input_path, output_dir)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                ffmpeg_path,
-                "-y",
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = {}
+            for input_path in files:
+                self._set_item_status(input_path, "video_saturation.running", generation)
+                output_path = self._output_path_for(input_path, output_dir)
+                futures[
+                    executor.submit(
+                        self._process_video,
+                        ffmpeg_path,
+                        input_path,
+                        output_path,
+                        saturation,
+                        gpu_mode,
+                        gpu_device,
+                        parallelism,
+                    )
+                ] = (input_path, output_path)
+
+            for future in as_completed(futures):
+                if self.cancel_event.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                input_path, output_path = futures[future]
+                try:
+                    future.result()
+                except subprocess.CalledProcessError as exc:
+                    if self.cancel_event.is_set():
+                        self._set_item_status(input_path, "video_saturation.failed", generation)
+                        continue
+                    stderr = (exc.stderr or "").strip()[-2000:]
+                    self.context.log(
+                        PLUGIN_ID,
+                        "ERROR",
+                        "Saturation adjustment failed",
+                        {"input": str(input_path), "output": str(output_path), "stderr": stderr},
+                    )
+                    self._set_item_status(input_path, "video_saturation.failed", generation)
+                except Exception as exc:
+                    if self.cancel_event.is_set() and str(exc) == "cancelled":
+                        self._set_item_status(input_path, "video_saturation.failed", generation)
+                        continue
+                    self.context.log(
+                        PLUGIN_ID,
+                        "ERROR",
+                        "Saturation adjustment failed",
+                        {"input": str(input_path), "output": str(output_path), "error": str(exc)},
+                    )
+                    self._set_item_status(input_path, "video_saturation.failed", generation)
+                else:
+                    completed += 1
+                    self.context.log(
+                        PLUGIN_ID,
+                        "INFO",
+                        "Saturation adjustment completed",
+                        {"input": str(input_path), "output": str(output_path), "gpu_mode": gpu_mode},
+                    )
+                    self._set_item_completed(input_path, output_path, generation)
+                processed += 1
+                self.after(0, self._update_progress, processed, total, "#2563eb", generation)
+                self.after(
+                    0,
+                    partial(
+                        self._set_status,
+                        "video_saturation.progress_text",
+                        generation,
+                        completed=completed,
+                        total=total,
+                    ),
+                )
+
+        self.after(0, self._finish_run, completed, total, generation, self.cancel_event.is_set())
+
+    def _process_video(
+        self,
+        ffmpeg_path: str,
+        input_path: Path,
+        output_path: Path,
+        saturation: float,
+        gpu_mode: str,
+        gpu_device: str,
+        parallelism: int,
+    ) -> None:
+        if self.cancel_event.is_set():
+            raise RuntimeError("cancelled")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [ffmpeg_path, "-y"]
+        if gpu_mode != "off":
+            cmd.extend(["-hwaccel", gpu_mode])
+        if parallelism > 1:
+            cmd.extend(["-threads", "1"])
+        cmd.extend(
+            [
                 "-i",
                 str(input_path),
                 "-vf",
@@ -342,54 +608,59 @@ class VideoSaturationPanel(ttk.Frame):
                 "copy",
                 str(output_path),
             ]
-            self.context.log(
-                PLUGIN_ID,
-                "INFO",
-                "Started saturation adjustment",
-                {"input": str(input_path), "output": str(output_path), "saturation": saturation},
-            )
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError as exc:
-                stderr = (exc.stderr or "").strip()[-2000:]
-                self.context.log(
-                    PLUGIN_ID,
-                    "ERROR",
-                    "Saturation adjustment failed",
-                    {"input": str(input_path), "output": str(output_path), "stderr": stderr},
-                )
-                self._set_item_status(input_path, "video_saturation.failed", generation)
-            except Exception as exc:
-                self.context.log(
-                    PLUGIN_ID,
-                    "ERROR",
-                    "Saturation adjustment failed",
-                    {"input": str(input_path), "output": str(output_path), "error": str(exc)},
-                )
-                self._set_item_status(input_path, "video_saturation.failed", generation)
-            else:
-                completed += 1
-                self.context.log(
-                    PLUGIN_ID,
-                    "INFO",
-                    "Saturation adjustment completed",
-                    {"input": str(input_path), "output": str(output_path)},
-                )
-                self._set_item_completed(input_path, output_path, generation)
-            processed += 1
-            self.after(0, self._update_progress, processed, total, "#2563eb", generation)
-            self.after(
-                0,
-                partial(
-                    self._set_status,
-                    "video_saturation.progress_text",
-                    generation,
-                    completed=completed,
-                    total=total,
-                ),
-            )
+        )
+        self.context.log(
+            PLUGIN_ID,
+            "INFO",
+            "Started saturation adjustment",
+            {
+                "input": str(input_path),
+                "output": str(output_path),
+                "saturation": saturation,
+                "gpu_mode": gpu_mode,
+                "gpu_device": gpu_device,
+            },
+        )
+        env = os.environ.copy()
+        if gpu_device and gpu_device != self.context.t("video_saturation.gpu.device.none"):
+            env["CUDA_VISIBLE_DEVICES"] = gpu_device
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        with self.process_lock:
+            self.active_processes.add(process)
+        try:
+            stdout, stderr = process.communicate()
+        finally:
+            with self.process_lock:
+                self.active_processes.discard(process)
+        if self.cancel_event.is_set():
+            raise RuntimeError("cancelled")
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
 
-        self.after(0, self._finish_run, completed, total, generation)
+    def _selected_gpu_mode(self) -> str:
+        mode = self.gpu_mode.get().strip()
+        if not self.gpu_available:
+            return "off"
+        return mode if mode in self.gpu_modes else "off"
+
+    def _selected_gpu_device(self) -> str:
+        selected = self.gpu_device.get().strip()
+        for device in self.gpu_devices:
+            if device["label"] == selected:
+                return device["value"]
+        return ""
+
+    def _stop_run(self) -> None:
+        if not self.running:
+            return
+        self.cancel_event.set()
+        with self.process_lock:
+            processes = list(self.active_processes)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        self.stop_button.configure(state=tk.DISABLED)
+        self._set_status("video_saturation.stopping")
 
     def _output_path_for(self, input_path: Path, output_dir: str) -> Path:
         source_directory = self.source_directories.get(str(input_path))
@@ -758,13 +1029,17 @@ class VideoSaturationPanel(ttk.Frame):
             value = value.replace(source, target)
         return value
 
-    def _finish_run(self, completed: int, total: int, generation: int) -> None:
+    def _finish_run(self, completed: int, total: int, generation: int, cancelled: bool = False) -> None:
         if generation != self.run_generation:
             return
         self.running = False
         self.run_button.configure(state=tk.NORMAL)
-        self._update_progress(total, total, "#16a34a" if completed == total else "#dc2626", generation)
-        self._set_status("video_saturation.finished", generation, completed=completed, total=total)
+        self.stop_button.configure(state=tk.DISABLED)
+        self._update_progress(total if not cancelled else completed, total, "#16a34a" if completed == total and not cancelled else "#dc2626", generation)
+        if cancelled:
+            self._set_status("video_saturation.cancelled", generation, completed=completed, total=total)
+        else:
+            self._set_status("video_saturation.finished", generation, completed=completed, total=total)
 
     def _update_progress(
         self,
@@ -806,11 +1081,20 @@ class VideoSaturationPanel(ttk.Frame):
     def set_language(self) -> None:
         self.saturation_label.configure(text=self.context.t("video_saturation.saturation_ratio"))
         self.output_dir_label.configure(text=self.context.t("video_saturation.output_directory"))
+        self.parallelism_label.configure(text=self.context.t("video_saturation.parallelism"))
+        self.gpu_label.configure(text=self.context.t("video_saturation.gpu.info"))
+        self.gpu_mode_label.configure(text=self.context.t("video_saturation.gpu.mode"))
+        self.gpu_device_label.configure(text=self.context.t("video_saturation.gpu.device"))
+        self.gpu_status_text.set(self._gpu_status_display_text())
+        self.gpu_mode_combo.configure(values=self.gpu_modes, state="readonly")
+        self.gpu_mode.set(self._selected_gpu_mode())
+        self.gpu_device_combo.configure(values=self.gpu_device_labels, state="readonly" if self.gpu_devices else tk.DISABLED)
         self.browse_button.configure(text=self.context.t("video_saturation.browse"))
         self.add_button.configure(text=self.context.t("video_saturation.add_videos"))
         self.add_directory_button.configure(text=self.context.t("video_saturation.add_directory"))
         self.clear_button.configure(text=self.context.t("video_saturation.clear"))
         self.run_button.configure(text=self.context.t("video_saturation.run"))
+        self.stop_button.configure(text=self.context.t("video_saturation.stop"))
         self.progress_label.configure(text=self.context.t("video_saturation.progress"))
         self.file_tree.heading("path", text=self.context.t("video_saturation.video"))
         self.file_tree.heading("status", text=self.context.t("video_saturation.status"))
