@@ -1,0 +1,3 @@
+# Runtime dependencies are Python standard library only.
+# ffmpeg is required as an external executable for the video saturation plugin.
+
