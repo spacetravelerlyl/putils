@@ -31,7 +31,7 @@ putils/
   app.py                   # Tkinter application shell
   database.py              # ConfigStore and LogStore
   i18n.py                  # Translation catalog and translator
-  paths.py                 # Cross-platform data paths
+  paths.py                 # Cross-platform data paths and database directory locator
   plugin_api.py            # Plugin contracts
   plugin_loader.py         # Bundled plugin discovery
   plugins/
@@ -65,6 +65,16 @@ You can override the data directory for development:
 ```bash
 PUTILS_DATA_DIR=/tmp/putils-dev python -m putils
 ```
+
+The effective data directory is resolved in this order:
+
+1. `PUTILS_DATA_DIR` environment variable.
+2. The locator file in the platform default data directory.
+3. The platform default data directory.
+
+The locator file is a small JSON file named `data_dir.json`. It is required because the application must know where `config.sqlite3` is before it can open the SQLite configuration database.
+
+Changing the database directory from the Settings page writes the locator file and takes effect after application restart. The application does not migrate existing database files automatically.
 
 Configuration database:
 
@@ -147,6 +157,8 @@ The selected language is stored in the configuration database:
 namespace: app
 key: language
 ```
+
+Language selection is managed from the Settings page. The language change is applied immediately and persisted to `config.sqlite3`.
 
 ### Adding A Language
 

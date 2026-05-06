@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 from .database import ConfigStore, LogStore
 from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, Translator
-from .paths import config_db_path, log_db_path
+from .paths import config_db_path, log_db_path, user_data_dir, write_configured_data_dir
 from .plugin_api import DependencyStatus
 from .plugin_loader import discover_plugins
 
@@ -47,6 +49,10 @@ class PUtilsApp(tk.Tk):
         self.plugins = []
         self.plugin_panels: list[object] = []
         self.empty_plugin_label = None
+        self.settings_frame = None
+        self.settings_tab_index: int | None = None
+        self.language_display_to_code: dict[str, str] = {}
+        self.language_code_to_display: dict[str, str] = {}
 
         self._configure_style()
         self._build_layout()
@@ -63,16 +69,10 @@ class PUtilsApp(tk.Tk):
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-
-        top_bar = ttk.Frame(self, padding=(8, 8, 8, 0))
-        top_bar.grid(row=0, column=0, sticky="ew")
-        top_bar.columnconfigure(0, weight=1)
-        self.language_button = ttk.Button(top_bar, command=self._toggle_language)
-        self.language_button.grid(row=0, column=1, sticky="e")
+        self.rowconfigure(0, weight=1)
 
         root = ttk.PanedWindow(self, orient=tk.VERTICAL)
-        root.grid(row=1, column=0, sticky="nsew")
+        root.grid(row=0, column=0, sticky="nsew")
 
         main_frame = ttk.Frame(root, padding=8)
         main_frame.columnconfigure(0, weight=1)
@@ -156,23 +156,66 @@ class PUtilsApp(tk.Tk):
             self.empty_plugin_label = ttk.Label(empty)
             self.empty_plugin_label.grid(row=0, column=0, sticky="w")
             self.plugin_notebook.add(empty, text=self.context.t("plugins.tab"))
-            return
+        else:
+            for plugin in self.plugins:
+                frame = ttk.Frame(self.plugin_notebook, padding=12)
+                frame.columnconfigure(0, weight=1)
+                panel = plugin.build(frame, self.context)
+                self.plugin_panels.append(panel)
+                self.plugin_notebook.add(
+                    frame,
+                    text=self.context.t(f"plugin.{plugin.metadata.plugin_id}.name", plugin.metadata.name),
+                )
+        self._add_settings_page()
 
-        for plugin in self.plugins:
-            frame = ttk.Frame(self.plugin_notebook, padding=12)
-            frame.columnconfigure(0, weight=1)
-            panel = plugin.build(frame, self.context)
-            self.plugin_panels.append(panel)
-            self.plugin_notebook.add(
-                frame,
-                text=self.context.t(f"plugin.{plugin.metadata.plugin_id}.name", plugin.metadata.name),
-            )
+    def _add_settings_page(self) -> None:
+        frame = ttk.Frame(self.plugin_notebook, padding=12)
+        frame.columnconfigure(1, weight=1)
+        self.settings_frame = frame
+
+        self.settings_title_label = ttk.Label(frame)
+        self.settings_title_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        self.settings_language_label = ttk.Label(frame)
+        self.settings_language_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self.language_var = tk.StringVar()
+        self.language_combo = ttk.Combobox(frame, textvariable=self.language_var, state="readonly", width=18)
+        self.language_combo.grid(row=1, column=1, sticky="w", pady=(0, 8))
+        self.language_combo.bind("<<ComboboxSelected>>", self._on_language_selected)
+
+        self.settings_data_dir_label = ttk.Label(frame)
+        self.settings_data_dir_label.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.data_dir_var = tk.StringVar(value=str(user_data_dir()))
+        self.data_dir_entry = ttk.Entry(frame, textvariable=self.data_dir_var)
+        self.data_dir_entry.grid(row=2, column=1, sticky="ew", pady=(0, 8))
+        self.data_dir_browse_button = ttk.Button(frame, command=self._choose_data_dir)
+        self.data_dir_browse_button.grid(row=2, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
+
+        self.settings_config_db_label = ttk.Label(frame)
+        self.settings_config_db_label.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.config_db_var = tk.StringVar(value=str(config_db_path()))
+        ttk.Entry(frame, textvariable=self.config_db_var, state="readonly").grid(
+            row=3, column=1, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+
+        self.settings_log_db_label = ttk.Label(frame)
+        self.settings_log_db_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
+        self.log_db_var = tk.StringVar(value=str(log_db_path()))
+        ttk.Entry(frame, textvariable=self.log_db_var, state="readonly").grid(
+            row=4, column=1, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+
+        self.settings_hint_label = ttk.Label(frame, wraplength=720)
+        self.settings_hint_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 10))
+
+        self.settings_save_button = ttk.Button(frame, command=self._save_settings)
+        self.settings_save_button.grid(row=6, column=1, sticky="w")
+
+        self.plugin_notebook.add(frame, text=self.context.t("settings.tab"))
+        self.settings_tab_index = self.plugin_notebook.index("end") - 1
 
     def _apply_language(self) -> None:
         self.title(self.context.t("app.title"))
-        target_language = "en" if self.translator.language == "zh" else "zh"
-        switch_key = "language.switch_to_en" if target_language == "en" else "language.switch_to_zh"
-        self.language_button.configure(text=self.context.t(switch_key))
 
         self.dependency_title_label.configure(text=self.context.t("dependency.title"))
         self.dependency_check_button.configure(text=self.context.t("dependency.check"))
@@ -209,18 +252,67 @@ class PUtilsApp(tk.Tk):
                 index,
                 text=self.context.t(f"plugin.{plugin.metadata.plugin_id}.name", plugin.metadata.name),
             )
+        self._apply_settings_language()
         for panel in self.plugin_panels:
             language_setter = getattr(panel, "set_language", None)
             if language_setter is not None:
                 language_setter()
         self._refresh_dependencies()
 
-    def _toggle_language(self) -> None:
-        current_index = SUPPORTED_LANGUAGES.index(self.translator.language)
-        next_language = SUPPORTED_LANGUAGES[(current_index + 1) % len(SUPPORTED_LANGUAGES)]
+    def _apply_settings_language(self) -> None:
+        if self.settings_frame is None:
+            return
+        self.language_code_to_display = {
+            code: self.context.t(f"settings.language.{code}", code) for code in SUPPORTED_LANGUAGES
+        }
+        self.language_display_to_code = {display: code for code, display in self.language_code_to_display.items()}
+        self.language_combo.configure(values=[self.language_code_to_display[code] for code in SUPPORTED_LANGUAGES])
+        self.language_var.set(self.language_code_to_display[self.translator.language])
+
+        self.settings_title_label.configure(text=self.context.t("settings.title"))
+        self.settings_language_label.configure(text=self.context.t("settings.language"))
+        self.settings_data_dir_label.configure(text=self.context.t("settings.data_dir"))
+        self.settings_config_db_label.configure(text=self.context.t("settings.config_db"))
+        self.settings_log_db_label.configure(text=self.context.t("settings.log_db"))
+        self.data_dir_browse_button.configure(text=self.context.t("settings.browse"))
+        self.settings_save_button.configure(text=self.context.t("settings.save"))
+        hint = self.context.t("settings.restart_hint")
+        if os.environ.get("PUTILS_DATA_DIR"):
+            hint = f"{hint} {self.context.t('settings.env_override')}"
+        self.settings_hint_label.configure(text=hint)
+        if self.settings_tab_index is not None:
+            self.plugin_notebook.tab(self.settings_tab_index, text=self.context.t("settings.tab"))
+
+    def _on_language_selected(self, _event=None) -> None:
+        selected = self.language_var.get()
+        next_language = self.language_display_to_code.get(selected)
+        if not next_language or next_language == self.translator.language:
+            return
         self.translator.set_language(next_language)
         self.config_store.set(APP_CONFIG_NAMESPACE, "language", next_language)
         self._apply_language()
+
+    def _choose_data_dir(self) -> None:
+        selected = filedialog.askdirectory(
+            title=self.context.t("settings.select_data_dir"),
+            initialdir=self.data_dir_var.get() or str(user_data_dir()),
+        )
+        if selected:
+            self.data_dir_var.set(str(Path(selected).expanduser().resolve()))
+
+    def _save_settings(self) -> None:
+        try:
+            data_dir = Path(self.data_dir_var.get()).expanduser().resolve()
+            data_dir.mkdir(parents=True, exist_ok=True)
+            write_configured_data_dir(data_dir)
+            self.config_store.set(APP_CONFIG_NAMESPACE, "configured_data_dir", str(data_dir))
+        except Exception as exc:
+            messagebox.showerror(self.context.t("settings.error.title"), str(exc))
+            return
+        messagebox.showinfo(
+            self.context.t("settings.saved.title"),
+            self.context.t("settings.saved.message"),
+        )
 
     def _refresh_dependencies(self) -> None:
         for item in self.dependency_tree.get_children():

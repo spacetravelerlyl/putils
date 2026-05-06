@@ -20,7 +20,22 @@ From the project directory:
 python -m putils
 ```
 
-The default interface language is Chinese. Use the language button in the top-right corner to switch between Chinese and English.
+The default interface language is Chinese. Open the `配置` / `Settings` tab to switch between Chinese and English.
+
+## Settings
+
+Open the `配置` / `Settings` tab to view and change application settings.
+
+Available settings:
+
+- Interface language.
+- Database directory.
+- Current `config.sqlite3` path.
+- Current `logs.sqlite3` path.
+
+Changing the database directory takes effect after restarting the application. Existing database files are not moved automatically.
+
+If `PUTILS_DATA_DIR` is set in the environment, it overrides the configured database directory.
 
 ## Dependency Status
 
