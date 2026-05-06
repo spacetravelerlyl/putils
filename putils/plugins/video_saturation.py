@@ -230,7 +230,7 @@ class VideoSaturationPanel(ttk.Frame):
             return
         directory = Path(selected).resolve()
         videos = sorted(
-            path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
+            path for path in directory.rglob("*") if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
         )
         if not videos:
             messagebox.showinfo(
@@ -400,6 +400,8 @@ class VideoSaturationPanel(ttk.Frame):
                 else source_directory.parent
             )
             directory = target_root / f"{source_directory.name}_saturation_adjusted"
+            relative_parent = input_path.parent.relative_to(source_directory)
+            directory = directory / relative_parent
         else:
             directory = Path(output_dir).expanduser().resolve() if output_dir else input_path.parent
         return directory / f"{input_path.stem}_saturation_adjusted{input_path.suffix}"
