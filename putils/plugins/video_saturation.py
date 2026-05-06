@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import threading
+import json
 from functools import partial
 from pathlib import Path
 import tkinter as tk
@@ -44,9 +45,10 @@ class VideoSaturationPlugin:
                 )
             ]
 
-        available = True
-        version = ""
-        message = context.t("video_saturation.dependency.ready")
+        statuses: list[DependencyStatus] = []
+        ffmpeg_available = True
+        ffmpeg_version = ""
+        ffmpeg_message = context.t("video_saturation.dependency.ready")
         try:
             result = subprocess.run(
                 [ffmpeg_path, "-version"],
@@ -55,23 +57,44 @@ class VideoSaturationPlugin:
                 text=True,
                 timeout=5,
             )
-            version = result.stdout.splitlines()[0] if result.stdout else ""
+            ffmpeg_version = result.stdout.splitlines()[0] if result.stdout else ""
         except Exception as exc:
-            available = False
-            message = context.t("video_saturation.dependency.version_failed", error=exc)
+            ffmpeg_available = False
+            ffmpeg_message = context.t("video_saturation.dependency.version_failed", error=exc)
 
-        return [
+        statuses.append(
             DependencyStatus(
                 plugin_id=PLUGIN_ID,
                 name="ffmpeg",
                 dependency_type="external command",
                 required=True,
-                available=available,
-                version=version,
+                available=ffmpeg_available,
+                version=ffmpeg_version,
                 path=ffmpeg_path,
-                message=message,
+                message=ffmpeg_message,
             )
-        ]
+        )
+
+        for command, message_key in (
+            ("ffplay", "video_saturation.dependency.ffplay_missing"),
+            ("ffprobe", "video_saturation.dependency.ffprobe_missing"),
+        ):
+            path = shutil.which(command)
+            statuses.append(
+                DependencyStatus(
+                    plugin_id=PLUGIN_ID,
+                    name=command,
+                    dependency_type="external command",
+                    required=False,
+                    available=path is not None,
+                    path=path or "",
+                    message=context.t("video_saturation.dependency.ready")
+                    if path
+                    else context.t(message_key),
+                )
+            )
+
+        return statuses
 
 
 class VideoSaturationPanel(ttk.Frame):
@@ -80,6 +103,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.context = context
         self.files: list[Path] = []
         self.item_status_keys: dict[str, str] = {}
+        self.output_paths: dict[str, Path] = {}
         self.output_dir = tk.StringVar(value=str(context.get_config(CONFIG_NAMESPACE, "output_dir", "")))
         self.saturation = tk.DoubleVar(value=float(context.get_config(CONFIG_NAMESPACE, "saturation", 0.7)))
         self.status = tk.StringVar(value=context.t("video_saturation.ready"))
@@ -169,6 +193,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.file_tree.column("path", width=690, anchor="w")
         self.file_tree.column("status", width=160, anchor="w")
         self.file_tree.grid(row=3, column=0, sticky="nsew")
+        self.file_tree.bind("<Button-3>", self._show_file_context_menu)
 
         scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.file_tree.yview)
         scrollbar.grid(row=3, column=1, sticky="ns")
@@ -199,6 +224,7 @@ class VideoSaturationPanel(ttk.Frame):
                 continue
             self.files.append(path)
             existing.add(path)
+            self.output_paths.pop(str(path), None)
             self.file_tree.insert(
                 "", tk.END, iid=str(path), values=(str(path), self.context.t("video_saturation.pending"))
             )
@@ -212,6 +238,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.running = False
         self.files.clear()
         self.item_status_keys.clear()
+        self.output_paths.clear()
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
         self.progress.set(0)
@@ -315,7 +342,7 @@ class VideoSaturationPanel(ttk.Frame):
                     "Saturation adjustment completed",
                     {"input": str(input_path), "output": str(output_path)},
                 )
-                self._set_item_status(input_path, "video_saturation.completed", generation)
+                self._set_item_completed(input_path, output_path, generation)
             processed += 1
             self.after(0, self._update_progress, processed, total, "#2563eb", generation)
             self.after(
@@ -341,10 +368,233 @@ class VideoSaturationPanel(ttk.Frame):
                 return
             iid = str(input_path)
             self.item_status_keys[iid] = status_key
+            if status_key != "video_saturation.completed":
+                self.output_paths.pop(iid, None)
             if self.file_tree.exists(iid):
                 self.file_tree.set(iid, "status", self.context.t(status_key))
 
         self.after(0, update)
+
+    def _set_item_completed(self, input_path: Path, output_path: Path, generation: int) -> None:
+        def update() -> None:
+            if generation != self.run_generation:
+                return
+            iid = str(input_path)
+            self.item_status_keys[iid] = "video_saturation.completed"
+            self.output_paths[iid] = output_path
+            if self.file_tree.exists(iid):
+                self.file_tree.set(iid, "status", self.context.t("video_saturation.completed"))
+
+        self.after(0, update)
+
+    def _show_file_context_menu(self, event) -> None:
+        item_id = self.file_tree.identify_row(event.y)
+        if item_id:
+            self.file_tree.selection_set(item_id)
+            self.file_tree.focus(item_id)
+        else:
+            self.file_tree.selection_remove(self.file_tree.selection())
+        menu = tk.Menu(self.file_tree, tearoff=0)
+        state = tk.NORMAL if self._selected_completed_pair() is not None else tk.DISABLED
+        menu.add_command(
+            label=self.context.t("video_saturation.context.compare_preview"),
+            command=self._compare_preview,
+            state=state,
+        )
+        menu.add_command(
+            label=self.context.t("video_saturation.context.compare_info"),
+            command=self._compare_video_info,
+            state=state,
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _selected_completed_pair(self) -> tuple[Path, Path] | None:
+        selection = self.file_tree.selection()
+        if not selection:
+            return None
+        input_path = Path(selection[0])
+        output_path = self.output_paths.get(selection[0])
+        if (
+            output_path is None
+            or self.item_status_keys.get(selection[0]) != "video_saturation.completed"
+            or not output_path.exists()
+        ):
+            return None
+        return input_path, output_path
+
+    def _compare_preview(self) -> None:
+        pair = self._selected_completed_pair()
+        if pair is None:
+            messagebox.showinfo(
+                self.context.t("video_saturation.preview_unavailable.title"),
+                self.context.t("video_saturation.preview_unavailable.message"),
+            )
+            return
+        ffplay_path = shutil.which("ffplay")
+        if not ffplay_path:
+            messagebox.showerror(
+                self.context.t("video_saturation.ffplay_missing.title"),
+                self.context.t("video_saturation.ffplay_missing.message"),
+            )
+            return
+        input_path, output_path = pair
+        for title_key, path in (
+            ("video_saturation.preview.original", input_path),
+            ("video_saturation.preview.converted", output_path),
+        ):
+            subprocess.Popen(
+                [
+                    ffplay_path,
+                    "-autoexit",
+                    "-window_title",
+                    f"{self.context.t(title_key)} - {path.name}",
+                    str(path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    def _compare_video_info(self) -> None:
+        pair = self._selected_completed_pair()
+        if pair is None:
+            messagebox.showinfo(
+                self.context.t("video_saturation.preview_unavailable.title"),
+                self.context.t("video_saturation.preview_unavailable.message"),
+            )
+            return
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffprobe_path:
+            messagebox.showerror(
+                self.context.t("video_saturation.ffprobe_missing.title"),
+                self.context.t("video_saturation.ffprobe_missing.message"),
+            )
+            return
+        input_path, output_path = pair
+        try:
+            original = self._probe_video(ffprobe_path, input_path)
+            converted = self._probe_video(ffprobe_path, output_path)
+        except Exception as exc:
+            messagebox.showerror(self.context.t("video_saturation.probe_failed.title"), str(exc))
+            return
+        self._show_video_info_window(input_path, output_path, original, converted)
+
+    def _probe_video(self, ffprobe_path: str, path: Path) -> dict[str, str]:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        data = json.loads(result.stdout)
+        video_stream = next((stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"), {})
+        audio_streams = [stream for stream in data.get("streams", []) if stream.get("codec_type") == "audio"]
+        video_rate = video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or ""
+        return {
+            "file": path.name,
+            "size": self._format_bytes(path.stat().st_size),
+            "duration": self._format_duration(data.get("format", {}).get("duration", "")),
+            "bitrate": self._format_bitrate(data.get("format", {}).get("bit_rate", "")),
+            "video_codec": str(video_stream.get("codec_name", "")),
+            "resolution": self._format_resolution(video_stream),
+            "frame_rate": self._format_frame_rate(str(video_rate)),
+            "audio": ", ".join(str(stream.get("codec_name", "")) for stream in audio_streams) or "-",
+        }
+
+    def _show_video_info_window(
+        self,
+        input_path: Path,
+        output_path: Path,
+        original: dict[str, str],
+        converted: dict[str, str],
+    ) -> None:
+        window = tk.Toplevel(self)
+        window.title(self.context.t("video_saturation.info_window.title"))
+        window.geometry("760x420")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        text = tk.Text(window, wrap="none", font=("TkFixedFont", 10))
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(window, orient=tk.VERTICAL, command=text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scrollbar.set)
+
+        lines = [
+            f"{self.context.t('video_saturation.info.original')}: {input_path}",
+            f"{self.context.t('video_saturation.info.converted')}: {output_path}",
+            "",
+            f"{self.context.t('video_saturation.info.field'):<18}"
+            f"{self.context.t('video_saturation.info.original'):<28}"
+            f"{self.context.t('video_saturation.info.converted')}",
+            "-" * 74,
+        ]
+        fields = (
+            ("file", "video_saturation.info.file"),
+            ("size", "video_saturation.info.size"),
+            ("duration", "video_saturation.info.duration"),
+            ("bitrate", "video_saturation.info.bitrate"),
+            ("video_codec", "video_saturation.info.video_codec"),
+            ("resolution", "video_saturation.info.resolution"),
+            ("frame_rate", "video_saturation.info.frame_rate"),
+            ("audio", "video_saturation.info.audio"),
+        )
+        for key, label_key in fields:
+            lines.append(f"{self.context.t(label_key):<18}{original[key]:<28}{converted[key]}")
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state=tk.DISABLED)
+
+    def _format_bytes(self, size: int) -> str:
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024 or unit == "GB":
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+            value /= 1024
+        return f"{value:.1f} GB"
+
+    def _format_duration(self, duration: str) -> str:
+        try:
+            total_seconds = int(round(float(duration)))
+        except (TypeError, ValueError):
+            return "-"
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _format_bitrate(self, bitrate: str) -> str:
+        try:
+            return f"{int(bitrate) / 1000:.0f} kbps"
+        except (TypeError, ValueError):
+            return "-"
+
+    def _format_resolution(self, stream: dict) -> str:
+        width = stream.get("width")
+        height = stream.get("height")
+        return f"{width}x{height}" if width and height else "-"
+
+    def _format_frame_rate(self, frame_rate: str) -> str:
+        if "/" not in frame_rate:
+            return frame_rate or "-"
+        numerator, denominator = frame_rate.split("/", 1)
+        try:
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return "-"
+            return f"{float(numerator) / denominator_value:.2f} fps"
+        except ValueError:
+            return "-"
 
     def _finish_run(self, completed: int, total: int, generation: int) -> None:
         if generation != self.run_generation:
