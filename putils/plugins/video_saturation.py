@@ -141,6 +141,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.output_paths: dict[str, Path] = {}
         self.source_directories: dict[str, Path] = {}
         self.error_details: dict[str, str] = {}
+        self.video_timing: dict[str, dict] = {}
         self.status_filter_var = tk.StringVar(value="all")
         self.detached_items: set[str] = set()
         self.output_dir = tk.StringVar(value=str(context.get_config(CONFIG_NAMESPACE, "output_dir", "")))
@@ -620,6 +621,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.output_paths.clear()
         self.source_directories.clear()
         self.error_details.clear()
+        self.video_timing.clear()
         self.detached_items.clear()
         self.current_task_id = ""
         self.context.cache_store.clear(PLUGIN_ID)
@@ -712,6 +714,9 @@ class VideoSaturationPanel(ttk.Frame):
         gpu_device: str,
         task_id: str,
     ) -> None:
+        task_start_monotonic = time.monotonic()
+        from datetime import datetime as _datetime, timezone as _timezone
+        task_start_time = _datetime.now(_timezone.utc)
         total = len(files)
         completed = 0
         processed = 0
@@ -793,7 +798,7 @@ class VideoSaturationPanel(ttk.Frame):
                 self.context.t("video_saturation.gpu.error_detected.title"),
                 self.context.t("video_saturation.gpu.error_detected.message", mode=gpu_mode),
             ))
-        self.after(0, self._finish_run, completed, total, generation, self.cancel_event.is_set())
+        self.after(0, self._finish_run, completed, total, generation, self.cancel_event.is_set(), task_start_time, task_start_monotonic)
 
     def _process_video(
         self,
@@ -847,7 +852,9 @@ class VideoSaturationPanel(ttk.Frame):
             "start_time": start_time.isoformat(timespec="milliseconds"),
             "end_time": end_time.isoformat(timespec="milliseconds"),
             "duration": self._format_elapsed(elapsed),
+            "duration_seconds": round(elapsed, 2),
         }
+        self.video_timing[str(input_path)] = timing
         if self.cancel_event.is_set():
             raise RuntimeError("cancelled")
         if process.returncode != 0:
@@ -1284,7 +1291,7 @@ class VideoSaturationPanel(ttk.Frame):
             value = value.replace(source, target)
         return value
 
-    def _finish_run(self, completed: int, total: int, generation: int, cancelled: bool = False) -> None:
+    def _finish_run(self, completed: int, total: int, generation: int, cancelled: bool = False, task_start_time=None, task_start_monotonic: float = 0) -> None:
         if generation != self.run_generation:
             return
         self.running = False
@@ -1301,6 +1308,12 @@ class VideoSaturationPanel(ttk.Frame):
         task_id = self.current_task_id
         if task_id:
             self._update_task_status(task_id, completed, failed, task_status)
+            task_end_time = None
+            task_elapsed = ""
+            if task_start_time is not None:
+                from datetime import datetime as _datetime, timezone as _timezone
+                task_end_time = _datetime.now(_timezone.utc)
+                task_elapsed = self._format_elapsed(time.monotonic() - task_start_monotonic)
             self.context.log(
                 PLUGIN_ID,
                 "INFO",
@@ -1311,6 +1324,13 @@ class VideoSaturationPanel(ttk.Frame):
                     "failed": failed,
                     "total": total,
                     "cancelled": cancelled,
+                    "gpu_mode": self.gpu_mode.get(),
+                    "gpu_device": self.gpu_device.get(),
+                    "parallelism": self.parallelism.get(),
+                    "saturation": round(float(self.saturation.get()), 2),
+                    "task_start_time": task_start_time.isoformat(timespec="milliseconds") if task_start_time else None,
+                    "task_end_time": task_end_time.isoformat(timespec="milliseconds") if task_end_time else None,
+                    "task_duration": task_elapsed,
                     "files": self._collect_file_statuses(),
                 },
             )
@@ -1320,7 +1340,15 @@ class VideoSaturationPanel(ttk.Frame):
         result: list[dict] = []
         for f in self.files:
             iid = str(f)
-            entry: dict = {"path": str(f), "status": self.item_status_keys.get(iid, "unknown")}
+            entry: dict = {
+                "path": str(f),
+                "status": self.item_status_keys.get(iid, "unknown"),
+            }
+            timing = self.video_timing.get(iid)
+            if timing:
+                entry["start_time"] = timing["start_time"]
+                entry["end_time"] = timing["end_time"]
+                entry["duration"] = timing["duration"]
             if iid in self.error_details:
                 try:
                     entry["error"] = json.loads(self.error_details[iid])
