@@ -295,7 +295,9 @@ class VideoSaturationPanel(ttk.Frame):
         self.stop_button = ttk.Button(actions, command=self._stop_run)
         self.stop_button.grid(row=0, column=6, padx=(6, 0))
         self.stop_button.configure(state=tk.DISABLED)
-        ttk.Label(actions, textvariable=self.status).grid(row=0, column=7, sticky="w", padx=(12, 0))
+        self.clear_history_button = ttk.Button(actions, command=self._clear_task_history)
+        self.clear_history_button.grid(row=0, column=7, padx=(18, 0))
+        ttk.Label(actions, textvariable=self.status).grid(row=0, column=8, sticky="w", padx=(12, 0))
 
         progress_frame = ttk.Frame(self)
         progress_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
@@ -663,6 +665,23 @@ class VideoSaturationPanel(ttk.Frame):
         self._redraw_progress("#9ca3af")
         self._set_status("video_saturation.ready")
         self.task_filter_var.set(self.context.t("video_saturation.task_filter.all"))
+        self._update_task_filter_combobox()
+
+    def _clear_task_history(self) -> None:
+        if self.running and self.worker_thread is not None and self.worker_thread.is_alive():
+            return
+        for step in range(1, 4):
+            confirmed = messagebox.askyesno(
+                self.context.t("video_saturation.clear_history.confirm.title", step=step),
+                self.context.t("video_saturation.clear_history.confirm.message", step=step),
+                parent=self,
+            )
+            if not confirmed:
+                return
+        self._clear_files()
+        self.context.cache_store.execute(f"DELETE FROM {TASKS_TABLE}")
+        self.context.cache_store.execute(f"DELETE FROM plugin_{PLUGIN_ID}")
+        self.task_filter_var.set("")
         self._update_task_filter_combobox()
 
     def _run(self) -> None:
@@ -1448,6 +1467,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.deselect_all_button.configure(text=self.context.t("video_saturation.deselect_all"))
         self.run_button.configure(text=self.context.t("video_saturation.run"))
         self.stop_button.configure(text=self.context.t("video_saturation.stop"))
+        self.clear_history_button.configure(text=self.context.t("video_saturation.clear_history"))
         self.progress_label.configure(text=self.context.t("video_saturation.progress"))
         self.status_filter_label.configure(text=self.context.t("video_saturation.filter.status"))
         self.status_filter_combo.configure(values=[
