@@ -1187,6 +1187,7 @@ class VideoSaturationPanel(ttk.Frame):
             self.context.t("video_saturation.completed"),
             self.context.t("video_saturation.failed"),
         ])
+        self.status_filter_var.set(self.context.t("video_saturation.filter.all"))
         self.file_tree.heading("path", text=self.context.t("video_saturation.video"))
         self.file_tree.heading("status", text=self.context.t("video_saturation.status"))
         self.status.set(self.context.t(self.status_key, **self.status_kwargs))
@@ -1294,8 +1295,6 @@ class VideoSaturationPanel(ttk.Frame):
         }
         target_status = status_map.get(filter_value)
         for item_id in list(self.detached_items):
-            if self.file_tree.exists(item_id):
-                continue
             self.file_tree.move(item_id, "", tk.END)
             self.detached_items.discard(item_id)
         if target_status is None:
