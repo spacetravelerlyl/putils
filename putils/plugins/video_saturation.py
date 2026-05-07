@@ -1420,7 +1420,6 @@ class VideoSaturationPanel(ttk.Frame):
             f"CREATE INDEX IF NOT EXISTS idx_plugin_{PLUGIN_ID}_task_id "
             f"ON plugin_{PLUGIN_ID}(task_id)"
         )
-        self._update_task_filter_combobox()
 
     def _restore_from_cache(self) -> None:
         rows = self.context.cache_store.get_all(PLUGIN_ID)
