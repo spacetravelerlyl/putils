@@ -1745,6 +1745,12 @@ class VideoSaturationPanel(ttk.Frame):
             selected_text = "☑" if self.selected_items.get(iid, True) else "☐"
             status_key = row["status"] if row["status"] else "video_saturation.pending"
             self.item_status_keys[iid] = status_key
+            if row["output_path"]:
+                self.output_paths[iid] = Path(row["output_path"])
+            if row["source_directory"]:
+                self.source_directories[iid] = Path(row["source_directory"])
+            if row["error_details"]:
+                self.error_details[iid] = row["error_details"]
             self.file_tree.insert(
                 "",
                 tk.END,
