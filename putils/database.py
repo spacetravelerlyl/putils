@@ -159,3 +159,106 @@ class LogStore:
                     (limit,),
                 ).fetchall()
             )
+
+    def query(
+        self,
+        limit: int = 200,
+        level: str | None = None,
+        plugin_id: str | None = None,
+        since: str | None = None,
+    ) -> list[sqlite3.Row]:
+        conditions = []
+        params: list[Any] = []
+        if level and level.lower() != "all":
+            conditions.append("level = ?")
+            params.append(level.upper())
+        if plugin_id and plugin_id.lower() != "all":
+            conditions.append("plugin_id = ?")
+            params.append(plugin_id)
+        if since:
+            conditions.append("created_at >= ?")
+            params.append(since)
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    f"""
+                    SELECT id, created_at, plugin_id, level, message, details
+                    FROM operation_logs
+                    WHERE {where_clause}
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (*params, limit),
+                ).fetchall()
+            )
+
+
+class CacheStore:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self._init_db()
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        pass
+
+    def ensure_plugin_table(self, plugin_id: str, schema_sql: str) -> None:
+        table_name = f"plugin_{plugin_id}"
+        with self.connect() as conn:
+            conn.execute(schema_sql.format(table_name=table_name))
+
+    def upsert(self, plugin_id: str, file_path: str, **fields: Any) -> None:
+        table_name = f"plugin_{plugin_id}"
+        columns = ["file_path", "updated_at"] + list(fields.keys())
+        values: list[Any] = [file_path, utc_now_iso()] + list(fields.values())
+        placeholders = ", ".join("?" * len(columns))
+        column_names = ", ".join(columns)
+        update_clause = ", ".join(f"{col} = excluded.{col}" for col in fields.keys())
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {table_name} ({column_names})
+                VALUES ({placeholders})
+                ON CONFLICT(file_path) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                    {', ' + update_clause if update_clause else ''}
+                """,
+                values,
+            )
+
+    def get_by_status(self, plugin_id: str, status: str | None = None) -> list[sqlite3.Row]:
+        table_name = f"plugin_{plugin_id}"
+        with self.connect() as conn:
+            if status:
+                return list(
+                    conn.execute(
+                        f"SELECT * FROM {table_name} WHERE status = ?",
+                        (status,),
+                    ).fetchall()
+                )
+            return list(conn.execute(f"SELECT * FROM {table_name}").fetchall())
+
+    def get_all(self, plugin_id: str) -> list[sqlite3.Row]:
+        table_name = f"plugin_{plugin_id}"
+        with self.connect() as conn:
+            return list(conn.execute(f"SELECT * FROM {table_name}").fetchall())
+
+    def delete(self, plugin_id: str, file_path: str) -> None:
+        table_name = f"plugin_{plugin_id}"
+        with self.connect() as conn:
+            conn.execute(f"DELETE FROM {table_name} WHERE file_path = ?", (file_path,))
+
+    def clear(self, plugin_id: str) -> None:
+        table_name = f"plugin_{plugin_id}"
+        with self.connect() as conn:
+            conn.execute(f"DELETE FROM {table_name}")
