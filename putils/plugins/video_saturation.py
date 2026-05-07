@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
@@ -461,6 +462,19 @@ class VideoSaturationPanel(ttk.Frame):
             return False
 
     @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total_ms = round(seconds * 1000)
+        minutes, rem_ms = divmod(total_ms, 60000)
+        secs, ms = divmod(rem_ms, 1000)
+        parts = []
+        if minutes:
+            parts.append(f"{minutes}min")
+        if secs or minutes:
+            parts.append(f"{secs}s")
+        parts.append(f"{ms}ms")
+        return ",".join(parts)
+
+    @staticmethod
     def _is_gpu_error(stderr: str) -> bool:
         markers = (
             "Cannot load",
@@ -674,17 +688,17 @@ class VideoSaturationPanel(ttk.Frame):
                         self._set_item_status(input_path, "video_saturation.failed", generation)
                         continue
                     stderr = (exc.stderr or "").strip()[-2000:]
-                    error_info = {"input": str(input_path), "output": str(output_path), "stderr": stderr}
+                    timing = getattr(exc, "_timing", {})
+                    error_info = {
+                        "input": str(input_path),
+                        "output": str(output_path),
+                        "stderr": stderr,
+                        **timing,
+                    }
                     if gpu_mode != "off" and not gpu_error_seen and self._is_gpu_error(stderr):
                         gpu_error_seen = True
                         error_info["gpu_hint"] = self.context.t("video_saturation.gpu.error_hint", mode=gpu_mode)
                     self.error_details[str(input_path)] = json.dumps(error_info)
-                    self.context.log(
-                        PLUGIN_ID,
-                        "ERROR",
-                        "Saturation adjustment failed",
-                        error_info,
-                    )
                     self._set_item_status(input_path, "video_saturation.failed", generation)
                 except Exception as exc:
                     if self.cancel_event.is_set() and str(exc) == "cancelled":
@@ -757,18 +771,10 @@ class VideoSaturationPanel(ttk.Frame):
                 str(output_path),
             ]
         )
-        self.context.log(
-            PLUGIN_ID,
-            "INFO",
-            "Started saturation adjustment",
-            {
-                "input": str(input_path),
-                "output": str(output_path),
-                "saturation": saturation,
-                "gpu_mode": gpu_mode,
-                "gpu_device": gpu_device,
-            },
-        )
+        from datetime import datetime as _datetime
+        from datetime import timezone as _timezone
+        start_time = _datetime.now(_timezone.utc)
+        start_monotonic = time.monotonic()
         env = os.environ.copy()
         if gpu_device and gpu_device != self.context.t("video_saturation.gpu.device.none"):
             env["CUDA_VISIBLE_DEVICES"] = gpu_device
@@ -780,10 +786,49 @@ class VideoSaturationPanel(ttk.Frame):
         finally:
             with self.process_lock:
                 self.active_processes.discard(process)
+        elapsed = time.monotonic() - start_monotonic
+        end_time = _datetime.now(_timezone.utc)
+        cmd_str = " ".join(cmd)
+        timing = {
+            "cmd": cmd_str,
+            "start_time": start_time.isoformat(timespec="milliseconds"),
+            "end_time": end_time.isoformat(timespec="milliseconds"),
+            "duration": self._format_elapsed(elapsed),
+        }
         if self.cancel_event.is_set():
             raise RuntimeError("cancelled")
         if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
+            stderr_tail = (stderr or "").strip()[-2000:]
+            self.context.log(
+                PLUGIN_ID,
+                "ERROR",
+                "Saturation adjustment failed",
+                {
+                    "input": str(input_path),
+                    "output": str(output_path),
+                    "saturation": saturation,
+                    "gpu_mode": gpu_mode,
+                    "gpu_device": gpu_device,
+                    "stderr": stderr_tail,
+                    **timing,
+                },
+            )
+            exc = subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
+            exc._timing = timing
+            raise exc
+        self.context.log(
+            PLUGIN_ID,
+            "INFO",
+            "Saturation adjustment completed",
+            {
+                "input": str(input_path),
+                "output": str(output_path),
+                "saturation": saturation,
+                "gpu_mode": gpu_mode,
+                "gpu_device": gpu_device,
+                **timing,
+            },
+        )
 
     def _selected_gpu_mode(self) -> str:
         mode = self.gpu_mode.get().strip()
