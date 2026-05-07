@@ -715,12 +715,6 @@ class VideoSaturationPanel(ttk.Frame):
                     self._set_item_status(input_path, "video_saturation.failed", generation)
                 else:
                     completed += 1
-                    self.context.log(
-                        PLUGIN_ID,
-                        "INFO",
-                        "Saturation adjustment completed",
-                        {"input": str(input_path), "output": str(output_path), "gpu_mode": gpu_mode},
-                    )
                     self._set_item_completed(input_path, output_path, generation)
                 processed += 1
                 self.after(0, self._update_progress, processed, total, "#2563eb", generation)
