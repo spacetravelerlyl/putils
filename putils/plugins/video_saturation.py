@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -11,10 +12,25 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from putils.plugin_api import DependencyStatus, PluginMetadata
+from putils.tk_utils import copy_treeview_selection_to_clipboard, open_in_file_manager
 
 
 PLUGIN_ID = "video_saturation"
 CONFIG_NAMESPACE = "plugin.video_saturation"
+CACHE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {table_name} (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path TEXT NOT NULL UNIQUE,
+    selected INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending',
+    output_path TEXT,
+    source_directory TEXT,
+    error_message TEXT,
+    error_details TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
 DEFAULT_PARALLELISM = max(1, min(4, os.cpu_count() or 1))
 VIDEO_FILE_TYPES = (
     ("video_saturation.file_types.video", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
@@ -105,9 +121,13 @@ class VideoSaturationPanel(ttk.Frame):
         super().__init__(parent)
         self.context = context
         self.files: list[Path] = []
+        self.selected_items: dict[str, bool] = {}
         self.item_status_keys: dict[str, str] = {}
         self.output_paths: dict[str, Path] = {}
         self.source_directories: dict[str, Path] = {}
+        self.error_details: dict[str, str] = {}
+        self.status_filter_var = tk.StringVar(value="all")
+        self.detached_items: set[str] = set()
         self.output_dir = tk.StringVar(value=str(context.get_config(CONFIG_NAMESPACE, "output_dir", "")))
         self.saturation = tk.DoubleVar(value=float(context.get_config(CONFIG_NAMESPACE, "saturation", 0.7)))
         self.parallelism = tk.IntVar(value=self._configured_parallelism())
@@ -143,10 +163,12 @@ class VideoSaturationPanel(ttk.Frame):
         self.gpu_device = tk.StringVar(value=default_device)
         self.gpu_status_text = tk.StringVar()
 
+        self._init_cache()
         self.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
+        self.rowconfigure(4, weight=1)
         self._build_ui()
+        self._restore_from_cache()
 
     def _build_ui(self) -> None:
         controls = ttk.Frame(self)
@@ -204,23 +226,37 @@ class VideoSaturationPanel(ttk.Frame):
         self.gpu_device_combo = ttk.Combobox(controls, textvariable=self.gpu_device, state="readonly", width=40)
         self.gpu_device_combo.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
+        filter_frame = ttk.Frame(self)
+        filter_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.status_filter_label = ttk.Label(filter_frame)
+        self.status_filter_label.grid(row=0, column=0, padx=(0, 4))
+        self.status_filter_combo = ttk.Combobox(
+            filter_frame, textvariable=self.status_filter_var, state="readonly", width=12
+        )
+        self.status_filter_combo.grid(row=0, column=1)
+        self.status_filter_combo.bind("<<ComboboxSelected>>", self._apply_status_filter)
+
         actions = ttk.Frame(self)
-        actions.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.add_button = ttk.Button(actions, command=self._add_files)
         self.add_button.grid(row=0, column=0, padx=(0, 6))
         self.add_directory_button = ttk.Button(actions, command=self._add_directory)
         self.add_directory_button.grid(row=0, column=1, padx=(0, 6))
         self.clear_button = ttk.Button(actions, command=self._clear_files)
         self.clear_button.grid(row=0, column=2, padx=(0, 6))
+        self.select_all_button = ttk.Button(actions, command=self._select_all)
+        self.select_all_button.grid(row=0, column=3, padx=(0, 6))
+        self.deselect_all_button = ttk.Button(actions, command=self._deselect_all)
+        self.deselect_all_button.grid(row=0, column=4, padx=(0, 6))
         self.run_button = ttk.Button(actions, command=self._run)
-        self.run_button.grid(row=0, column=3)
+        self.run_button.grid(row=0, column=5)
         self.stop_button = ttk.Button(actions, command=self._stop_run)
-        self.stop_button.grid(row=0, column=4, padx=(6, 0))
+        self.stop_button.grid(row=0, column=6, padx=(6, 0))
         self.stop_button.configure(state=tk.DISABLED)
-        ttk.Label(actions, textvariable=self.status).grid(row=0, column=5, sticky="w", padx=(12, 0))
+        ttk.Label(actions, textvariable=self.status).grid(row=0, column=7, sticky="w", padx=(12, 0))
 
         progress_frame = ttk.Frame(self)
-        progress_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        progress_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         progress_frame.columnconfigure(1, weight=1)
         self.progress_label = ttk.Label(progress_frame)
         self.progress_label.grid(row=0, column=0, sticky="w")
@@ -241,17 +277,20 @@ class VideoSaturationPanel(ttk.Frame):
         )
         self.progress_canvas.bind("<Configure>", lambda _event: self._redraw_progress())
 
-        columns = ("path", "status")
+        columns = ("selected", "path", "status")
         self.file_tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
+        self.file_tree.heading("selected", text="", command=self._toggle_select_all)
         self.file_tree.heading("path", text="path")
         self.file_tree.heading("status", text="status")
-        self.file_tree.column("path", width=690, anchor="w")
-        self.file_tree.column("status", width=160, anchor="w")
-        self.file_tree.grid(row=3, column=0, sticky="nsew")
+        self.file_tree.column("selected", width=40, anchor="center", stretch=False)
+        self.file_tree.column("path", width=650, anchor="w")
+        self.file_tree.column("status", width=150, anchor="w")
+        self.file_tree.grid(row=4, column=0, sticky="nsew")
         self.file_tree.bind("<Button-3>", self._show_file_context_menu)
+        self.file_tree.bind("<ButtonRelease-1>", self._on_tree_click)
 
         scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.file_tree.yview)
-        scrollbar.grid(row=3, column=1, sticky="ns")
+        scrollbar.grid(row=4, column=1, sticky="ns")
         self.file_tree.configure(yscrollcommand=scrollbar.set)
         self.set_language()
 
@@ -415,7 +454,9 @@ class VideoSaturationPanel(ttk.Frame):
             self.files.append(resolved)
             existing.add(resolved)
             item_id = str(resolved)
+            self.selected_items[item_id] = True
             self.output_paths.pop(item_id, None)
+            self.error_details.pop(item_id, None)
             if source_directory is not None:
                 self.source_directories[item_id] = source_directory
             else:
@@ -424,9 +465,11 @@ class VideoSaturationPanel(ttk.Frame):
                 "",
                 tk.END,
                 iid=item_id,
-                values=(str(resolved), self.context.t("video_saturation.pending")),
+                values=("☑", str(resolved), self.context.t("video_saturation.pending")),
             )
             self.item_status_keys[item_id] = "video_saturation.pending"
+        self._save_to_cache()
+        self._apply_status_filter()
         self._set_status("video_saturation.selected", count=len(self.files))
 
     def _clear_files(self) -> None:
@@ -435,9 +478,13 @@ class VideoSaturationPanel(ttk.Frame):
         self.run_generation += 1
         self.running = False
         self.files.clear()
+        self.selected_items.clear()
         self.item_status_keys.clear()
         self.output_paths.clear()
         self.source_directories.clear()
+        self.error_details.clear()
+        self.detached_items.clear()
+        self.context.cache_store.clear(PLUGIN_ID)
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
         self.progress.set(0)
@@ -454,6 +501,13 @@ class VideoSaturationPanel(ttk.Frame):
                 self.context.t("video_saturation.no_videos.message"),
             )
             return
+        selected_files = [f for f in self.files if self.selected_items.get(str(f), True)]
+        if not selected_files:
+            messagebox.showwarning(
+                self.context.t("video_saturation.no_selected.title"),
+                self.context.t("video_saturation.no_selected.message"),
+            )
+            return
         ffmpeg_path = shutil.which("ffmpeg")
         if not ffmpeg_path:
             messagebox.showerror(
@@ -464,7 +518,7 @@ class VideoSaturationPanel(ttk.Frame):
             return
 
         output_dir = self.output_dir.get().strip()
-        files = list(self.files)
+        files = selected_files
         try:
             parallelism = self._selected_parallelism()
         except ValueError as exc:
@@ -538,22 +592,26 @@ class VideoSaturationPanel(ttk.Frame):
                         self._set_item_status(input_path, "video_saturation.failed", generation)
                         continue
                     stderr = (exc.stderr or "").strip()[-2000:]
+                    error_info = {"input": str(input_path), "output": str(output_path), "stderr": stderr}
+                    self.error_details[str(input_path)] = json.dumps(error_info)
                     self.context.log(
                         PLUGIN_ID,
                         "ERROR",
                         "Saturation adjustment failed",
-                        {"input": str(input_path), "output": str(output_path), "stderr": stderr},
+                        error_info,
                     )
                     self._set_item_status(input_path, "video_saturation.failed", generation)
                 except Exception as exc:
                     if self.cancel_event.is_set() and str(exc) == "cancelled":
                         self._set_item_status(input_path, "video_saturation.failed", generation)
                         continue
+                    error_info = {"input": str(input_path), "output": str(output_path), "error": str(exc)}
+                    self.error_details[str(input_path)] = json.dumps(error_info)
                     self.context.log(
                         PLUGIN_ID,
                         "ERROR",
                         "Saturation adjustment failed",
-                        {"input": str(input_path), "output": str(output_path), "error": str(exc)},
+                        error_info,
                     )
                     self._set_item_status(input_path, "video_saturation.failed", generation)
                 else:
@@ -710,6 +768,28 @@ class VideoSaturationPanel(ttk.Frame):
         else:
             self.file_tree.selection_remove(self.file_tree.selection())
         menu = tk.Menu(self.file_tree, tearoff=0)
+        menu.add_command(
+            label=self.context.t("video_saturation.context.process_selected"),
+            command=self._process_selected,
+        )
+        menu.add_command(
+            label=self.context.t("video_saturation.context.copy_path"),
+            command=lambda: copy_treeview_selection_to_clipboard(self.file_tree, self.file_tree),
+        )
+        if item_id:
+            source_dir = self.source_directories.get(item_id)
+            if source_dir and source_dir.exists():
+                menu.add_command(
+                    label=self.context.t("video_saturation.context.open_source_dir"),
+                    command=lambda d=source_dir: open_in_file_manager(str(d)),
+                )
+            output_path = self.output_paths.get(item_id)
+            if output_path and output_path.exists():
+                menu.add_command(
+                    label=self.context.t("video_saturation.context.open_target_dir"),
+                    command=lambda p=output_path: open_in_file_manager(str(p)),
+                )
+        menu.add_separator()
         state = tk.NORMAL if self._selected_completed_pair() is not None else tk.DISABLED
         menu.add_command(
             label=self.context.t("video_saturation.context.compare_preview"),
@@ -1040,6 +1120,7 @@ class VideoSaturationPanel(ttk.Frame):
             self._set_status("video_saturation.cancelled", generation, completed=completed, total=total)
         else:
             self._set_status("video_saturation.finished", generation, completed=completed, total=total)
+        self._save_to_cache()
 
     def _update_progress(
         self,
@@ -1093,15 +1174,137 @@ class VideoSaturationPanel(ttk.Frame):
         self.add_button.configure(text=self.context.t("video_saturation.add_videos"))
         self.add_directory_button.configure(text=self.context.t("video_saturation.add_directory"))
         self.clear_button.configure(text=self.context.t("video_saturation.clear"))
+        self.select_all_button.configure(text=self.context.t("video_saturation.select_all"))
+        self.deselect_all_button.configure(text=self.context.t("video_saturation.deselect_all"))
         self.run_button.configure(text=self.context.t("video_saturation.run"))
         self.stop_button.configure(text=self.context.t("video_saturation.stop"))
         self.progress_label.configure(text=self.context.t("video_saturation.progress"))
+        self.status_filter_label.configure(text=self.context.t("video_saturation.filter.status"))
+        self.status_filter_combo.configure(values=[
+            self.context.t("video_saturation.filter.all"),
+            self.context.t("video_saturation.pending"),
+            self.context.t("video_saturation.running"),
+            self.context.t("video_saturation.completed"),
+            self.context.t("video_saturation.failed"),
+        ])
         self.file_tree.heading("path", text=self.context.t("video_saturation.video"))
         self.file_tree.heading("status", text=self.context.t("video_saturation.status"))
         self.status.set(self.context.t(self.status_key, **self.status_kwargs))
+        self._refresh_selection_display()
         for item_id, status_key in self.item_status_keys.items():
             if self.file_tree.exists(item_id):
                 self.file_tree.set(item_id, "status", self.context.t(status_key))
+
+    def _init_cache(self) -> None:
+        self.context.cache_store.ensure_plugin_table(PLUGIN_ID, CACHE_SCHEMA)
+
+    def _restore_from_cache(self) -> None:
+        rows = self.context.cache_store.get_all(PLUGIN_ID)
+        for row in rows:
+            file_path = Path(row["file_path"])
+            if not file_path.exists():
+                continue
+            iid = str(file_path)
+            self.files.append(file_path)
+            self.selected_items[iid] = bool(row["selected"])
+            self.item_status_keys[iid] = row["status"]
+            if row["output_path"]:
+                self.output_paths[iid] = Path(row["output_path"])
+            if row["source_directory"]:
+                self.source_directories[iid] = Path(row["source_directory"])
+            if row["error_details"]:
+                self.error_details[iid] = row["error_details"]
+            selected_text = "☑" if self.selected_items[iid] else "☐"
+            status_key = row["status"]
+            self.file_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(selected_text, str(file_path), self.context.t(status_key)),
+            )
+        if self.files:
+            self._set_status("video_saturation.selected", count=len(self.files))
+
+    def _save_to_cache(self) -> None:
+        from datetime import datetime, timezone
+        for file_path in self.files:
+            iid = str(file_path)
+            self.context.cache_store.upsert(
+                PLUGIN_ID,
+                str(file_path),
+                selected=1 if self.selected_items.get(iid, True) else 0,
+                status=self.item_status_keys.get(iid, "video_saturation.pending"),
+                output_path=str(self.output_paths.get(iid, "")),
+                source_directory=str(self.source_directories.get(iid, "")),
+                error_message="",
+                error_details=self.error_details.get(iid, ""),
+                created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            )
+
+    def _process_selected(self) -> None:
+        self._run()
+
+    def _on_tree_click(self, event) -> None:
+        region = self.file_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.file_tree.identify_column(event.x)
+        if column != "#1":
+            return
+        item_id = self.file_tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.selected_items[item_id] = not self.selected_items.get(item_id, True)
+        self._refresh_selection_display()
+
+    def _select_all(self) -> None:
+        for item_id in self.file_tree.get_children():
+            self.selected_items[item_id] = True
+        self._refresh_selection_display()
+
+    def _deselect_all(self) -> None:
+        for item_id in self.file_tree.get_children():
+            self.selected_items[item_id] = False
+        self._refresh_selection_display()
+
+    def _toggle_select_all(self) -> None:
+        children = self.file_tree.get_children()
+        if not children:
+            return
+        selected_count = sum(1 for item_id in children if self.selected_items.get(item_id, True))
+        if selected_count > len(children) // 2:
+            self._deselect_all()
+        else:
+            self._select_all()
+
+    def _refresh_selection_display(self) -> None:
+        for item_id in self.file_tree.get_children():
+            selected = self.selected_items.get(item_id, True)
+            selected_text = "☑" if selected else "☐"
+            self.file_tree.set(item_id, "selected", selected_text)
+
+    def _apply_status_filter(self, event=None) -> None:
+        filter_value = self.status_filter_var.get()
+        status_map = {
+            self.context.t("video_saturation.filter.all"): None,
+            self.context.t("video_saturation.pending"): "video_saturation.pending",
+            self.context.t("video_saturation.running"): "video_saturation.running",
+            self.context.t("video_saturation.completed"): "video_saturation.completed",
+            self.context.t("video_saturation.failed"): "video_saturation.failed",
+        }
+        target_status = status_map.get(filter_value)
+        for item_id in list(self.detached_items):
+            if self.file_tree.exists(item_id):
+                continue
+            self.file_tree.move(item_id, "", tk.END)
+            self.detached_items.discard(item_id)
+        if target_status is None:
+            return
+        for item_id in self.file_tree.get_children():
+            item_status = self.item_status_keys.get(item_id)
+            if item_status != target_status:
+                self.file_tree.detach(item_id)
+                self.detached_items.add(item_id)
 
 
 def create_plugin() -> VideoSaturationPlugin:

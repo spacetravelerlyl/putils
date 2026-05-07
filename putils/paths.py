@@ -76,5 +76,9 @@ def log_db_path() -> Path:
     return ensure_data_dir() / "logs.sqlite3"
 
 
+def cache_db_path() -> Path:
+    return ensure_data_dir() / "cache.sqlite3"
+
+
 def bundled_plugins_dir() -> Path:
     return Path(__file__).resolve().parent / "plugins"
