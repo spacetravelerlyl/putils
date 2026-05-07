@@ -1556,7 +1556,7 @@ class VideoSaturationPanel(ttk.Frame):
                     continue
                 iid = str(file_path)
                 selected_text = "☑" if self.selected_items.get(iid, True) else "☐"
-                status_key = row.get("status", "video_saturation.pending")
+                status_key = row["status"] if row["status"] else "video_saturation.pending"
                 self.file_tree.insert(
                     "",
                     tk.END,
