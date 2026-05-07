@@ -21,6 +21,12 @@
 - **[打包速查表](packaging/quick-reference.md)** - 常用命令和问题解决
 - **[构建脚本说明](packaging/BUILD_SCRIPTS.md)** - 所有构建脚本详解 ⭐ 新增
 - **[故障排除指南](packaging/TROUBLESHOOTING.md)** - 常见错误及解决方案 ⭐ 新增
+- **[应用启动无响应排查](packaging/SILENT_STARTUP_TROUBLESHOOTING.md)** - 静默失败诊断 ⭐⭐⭐ 新增
+- **[单文件黑框闪现修复](packaging/SINGLE_FILE_FLASH_FIX.md)** - 控制台窗口闪烁解决方案 ⭐⭐⭐ 新增
+- **[相对导入最终解决方案](packaging/FIX_RELATIVE_IMPORTS_FINAL.md)** - 改为绝对导入（推荐）⭐⭐⭐
+- **[相对导入错误修复](packaging/QUICK_FIX_RELATIVE_IMPORT_ERROR.md)** - ImportError 快速修复
+- **[pyimod02_importers 错误修复](packaging/QUICK_FIX_IMPORTERS_ERROR.md)** - NULL 错误快速修复
+- **[批处理文件编码问题修复](packaging/BATCH_FILE_ENCODING_FIX.md)** - 命令解析错误修复
 
 #### 详细教程
 - **[跨平台打包指南](packaging/cross-platform-packaging.md)** - ⭐ Windows + Linux 完整教程

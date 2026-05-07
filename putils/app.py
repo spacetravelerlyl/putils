@@ -8,12 +8,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .database import CacheStore, ConfigStore, LogStore
-from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, Translator
-from .paths import cache_db_path, config_db_path, default_user_data_dir, log_db_path, user_data_dir, write_configured_data_dir
-from .plugin_api import DependencyStatus
-from .plugin_loader import discover_plugins
-from .tk_utils import copy_treeview_selection_to_clipboard
+# Changed from relative imports to absolute imports for PyInstaller compatibility
+from putils.database import CacheStore, ConfigStore, LogStore
+from putils.i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, Translator
+from putils.paths import cache_db_path, config_db_path, default_user_data_dir, log_db_path, user_data_dir, write_configured_data_dir
+from putils.plugin_api import DependencyStatus
+from putils.plugin_loader import discover_plugins
+from putils.tk_utils import copy_treeview_selection_to_clipboard
 
 
 APP_CONFIG_NAMESPACE = "app"
@@ -832,6 +833,45 @@ class PUtilsApp(tk.Tk):
         text.insert("1.0", json.dumps(details, indent=2, ensure_ascii=False))
         text.configure(state=tk.DISABLED)
 
+
 def main() -> None:
-    app = PUtilsApp()
-    app.mainloop()
+    """Main entry point for the application."""
+    try:
+        app = PUtilsApp()
+        app.mainloop()
+    except Exception as e:
+        import traceback
+        import sys
+        
+        # Print error to console (visible in console mode builds)
+        print("=" * 60)
+        print("ERROR: Application failed to start!")
+        print("=" * 60)
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {str(e)}")
+        print("-" * 60)
+        print("Traceback:")
+        traceback.print_exc()
+        print("=" * 60)
+        
+        # For windowed mode, show a message box
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            
+            root = tk.Tk()
+            root.withdraw()  # Hide the root window
+            messagebox.showerror(
+                "Application Error",
+                f"Failed to start PUtils:\n\n{type(e).__name__}: {str(e)}\n\n"
+                f"Please check the console output for details."
+            )
+            root.destroy()
+        except:
+            pass
+        
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

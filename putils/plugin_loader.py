@@ -4,7 +4,8 @@ import importlib
 import pkgutil
 from types import ModuleType
 
-from .plugin_api import UtilityPlugin
+# Changed from relative import to absolute import for PyInstaller compatibility
+from putils.plugin_api import UtilityPlugin
 
 
 def _load_module(module_name: str) -> ModuleType:

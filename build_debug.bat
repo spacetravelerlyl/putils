@@ -1,5 +1,5 @@
 @echo off
-REM Debug build script for troubleshooting PyInstaller issues
+REM Debug build script with absolute imports
 
 echo ========================================
 echo Building putils with Debug Mode
@@ -22,22 +22,7 @@ echo [3/3] Building with debug mode enabled...
 echo This will create a console window to show errors.
 echo.
 
-pyinstaller --clean ^
-    --name=putils-debug ^
-    --windowed ^
-    --onefile ^
-    --debug=all ^
-    --add-data "putils/i18n.py;putils" ^
-    --add-data "putils/plugins;putils/plugins" ^
-    --hidden-import=putils.plugins ^
-    --hidden-import=putils.plugins.video_saturation ^
-    --hidden-import=zoneinfo ^
-    --hidden-import=tkinter ^
-    --hidden-import=sqlite3 ^
-    --hidden-import=encodings ^
-    --hidden-import=encodings.utf_8 ^
-    --collect-all=tkinter ^
-    putils/app.py
+pyinstaller --clean --name=putils-debug --windowed --onefile --debug=all --add-data "putils/plugins;putils/plugins" --hidden-import=putils --hidden-import=putils.app --hidden-import=putils.database --hidden-import=putils.i18n --hidden-import=putils.paths --hidden-import=putils.plugin_api --hidden-import=putils.plugin_loader --hidden-import=putils.tk_utils --hidden-import=putils.plugins --hidden-import=putils.plugins.video_saturation --hidden-import=zoneinfo --hidden-import=tkinter --hidden-import=sqlite3 --hidden-import=encodings --collect-all=tkinter putils/app.py
 
 if errorlevel 1 (
     echo.
