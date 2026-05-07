@@ -19,6 +19,9 @@ from .tk_utils import copy_treeview_selection_to_clipboard
 APP_CONFIG_NAMESPACE = "app"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_LOG_RETENTION_LIMIT = 1_000_000
+DEFAULT_LOG_LEVEL = "INFO"
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+LOG_LEVEL_WEIGHTS: dict[str, int] = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 SUPPORTED_TIMEZONES = (
     "Asia/Shanghai",
     "UTC",
@@ -32,11 +35,12 @@ SUPPORTED_TIMEZONES = (
 
 
 class AppContext:
-    def __init__(self, config_store: ConfigStore, log_store: LogStore, cache_store: CacheStore, translator: Translator) -> None:
+    def __init__(self, config_store: ConfigStore, log_store: LogStore, cache_store: CacheStore, translator: Translator, min_log_level: str = DEFAULT_LOG_LEVEL) -> None:
         self.config_store = config_store
         self.log_store = log_store
         self.cache_store = cache_store
         self.translator = translator
+        self.min_log_level = min_log_level
 
     def get_config(self, namespace: str, key: str, default: object = None) -> object:
         return self.config_store.get(namespace, key, default)
@@ -45,6 +49,8 @@ class AppContext:
         self.config_store.set(namespace, key, value)
 
     def log(self, plugin_id: str, level: str, message: str, details: dict | None = None) -> None:
+        if LOG_LEVEL_WEIGHTS.get(level, 0) < LOG_LEVEL_WEIGHTS.get(self.min_log_level, 20):
+            return
         self.log_store.add(plugin_id, level, message, details)
 
     def t(self, key: str, default: str | None = None, **kwargs: object) -> str:
@@ -61,11 +67,12 @@ class PUtilsApp(tk.Tk):
         language = str(self.config_store.get(APP_CONFIG_NAMESPACE, "language", DEFAULT_LANGUAGE))
         self.display_timezone = str(self.config_store.get(APP_CONFIG_NAMESPACE, "timezone", DEFAULT_TIMEZONE))
         self.log_retention_limit = self._configured_log_retention_limit()
+        self.log_level = str(self.config_store.get(APP_CONFIG_NAMESPACE, "log_level", DEFAULT_LOG_LEVEL))
         self.log_store = LogStore(log_db_path(), self.log_retention_limit)
         self.log_store.rotate()
         self.cache_store = CacheStore(cache_db_path())
         self.translator = Translator(language)
-        self.context = AppContext(self.config_store, self.log_store, self.cache_store, self.translator)
+        self.context = AppContext(self.config_store, self.log_store, self.cache_store, self.translator, self.log_level)
         self._log_refresh_after_id: str | None = None
         self._log_details: dict[str, dict] = {}
         self.plugins = []
@@ -75,6 +82,7 @@ class PUtilsApp(tk.Tk):
         self.plugin_tab_indices: list[int] = []
         self.settings_frame = None
         self.settings_tab_index: int | None = None
+        self.logs_tab_index: int | None = None
         self.language_display_to_code: dict[str, str] = {}
         self.language_code_to_display: dict[str, str] = {}
         self.current_data_dir = user_data_dir().resolve()
@@ -106,13 +114,10 @@ class PUtilsApp(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        root = ttk.PanedWindow(self, orient=tk.VERTICAL)
-        root.grid(row=0, column=0, sticky="nsew")
-
-        main_frame = ttk.Frame(root, padding=8)
+        main_frame = ttk.Frame(self, padding=8)
+        main_frame.grid(row=0, column=0, sticky="nsew")
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(1, weight=1)
-        root.add(main_frame, weight=4)
 
         dependency_frame = ttk.Frame(main_frame)
         dependency_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -153,10 +158,10 @@ class PUtilsApp(tk.Tk):
         self.plugin_notebook = ttk.Notebook(main_frame)
         self.plugin_notebook.grid(row=1, column=0, sticky="nsew")
 
-        log_frame = ttk.Frame(root, padding=8)
+    def _add_logs_page(self) -> None:
+        log_frame = ttk.Frame(self.plugin_notebook, padding=8)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(2, weight=1)
-        root.add(log_frame, weight=1)
 
         filter_frame = ttk.Frame(log_frame)
         filter_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
@@ -213,10 +218,14 @@ class PUtilsApp(tk.Tk):
         scrollbar.grid(row=2, column=1, sticky="ns")
         self.log_tree.configure(yscrollcommand=scrollbar.set)
 
+        self.plugin_notebook.add(log_frame, text=self.context.t("logs.tab"))
+        self.logs_tab_index = self.plugin_notebook.index("end") - 1
+
     def _load_plugins(self) -> None:
         self.plugins = discover_plugins()
         self._refresh_dependencies()
         self._add_settings_page()
+        self._add_logs_page()
         if not self.plugins:
             empty = ttk.Frame(self.plugin_notebook, padding=16)
             self.empty_plugin_label = ttk.Label(empty)
@@ -276,46 +285,54 @@ class PUtilsApp(tk.Tk):
         )
         self.log_retention_spinbox.grid(row=3, column=1, sticky="w", pady=(0, 8))
 
+        self.settings_log_level_label = ttk.Label(frame)
+        self.settings_log_level_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
+        self.log_level_var = tk.StringVar(value=self.log_level)
+        self.log_level_combo = ttk.Combobox(
+            frame, textvariable=self.log_level_var, values=list(LOG_LEVELS), state="readonly", width=10
+        )
+        self.log_level_combo.grid(row=4, column=1, sticky="w", pady=(0, 8))
+
         self.settings_data_dir_label = ttk.Label(frame)
-        self.settings_data_dir_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
+        self.settings_data_dir_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
         self.data_dir_var = tk.StringVar(value=str(self.current_data_dir))
         self.data_dir_entry = ttk.Entry(frame, textvariable=self.data_dir_var)
-        self.data_dir_entry.grid(row=4, column=1, sticky="ew", pady=(0, 8))
+        self.data_dir_entry.grid(row=5, column=1, sticky="ew", pady=(0, 8))
         self.data_dir_browse_button = ttk.Button(frame, command=self._choose_data_dir)
-        self.data_dir_browse_button.grid(row=4, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
+        self.data_dir_browse_button.grid(row=5, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
         self.data_dir_var.trace_add("write", lambda *_args: self._update_migration_button())
 
         self.settings_config_db_label = ttk.Label(frame)
-        self.settings_config_db_label.grid(row=5, column=0, sticky="w", pady=(0, 8))
+        self.settings_config_db_label.grid(row=6, column=0, sticky="w", pady=(0, 8))
         self.config_db_var = tk.StringVar(value=str(config_db_path()))
         ttk.Entry(frame, textvariable=self.config_db_var, state="readonly").grid(
-            row=5, column=1, columnspan=2, sticky="ew", pady=(0, 8)
-        )
-
-        self.settings_log_db_label = ttk.Label(frame)
-        self.settings_log_db_label.grid(row=6, column=0, sticky="w", pady=(0, 8))
-        self.log_db_var = tk.StringVar(value=str(log_db_path()))
-        ttk.Entry(frame, textvariable=self.log_db_var, state="readonly").grid(
             row=6, column=1, columnspan=2, sticky="ew", pady=(0, 8)
         )
 
-        self.settings_cache_db_label = ttk.Label(frame)
-        self.settings_cache_db_label.grid(row=7, column=0, sticky="w", pady=(0, 8))
-        self.cache_db_var = tk.StringVar(value=str(cache_db_path()))
-        ttk.Entry(frame, textvariable=self.cache_db_var, state="readonly").grid(
+        self.settings_log_db_label = ttk.Label(frame)
+        self.settings_log_db_label.grid(row=7, column=0, sticky="w", pady=(0, 8))
+        self.log_db_var = tk.StringVar(value=str(log_db_path()))
+        ttk.Entry(frame, textvariable=self.log_db_var, state="readonly").grid(
             row=7, column=1, columnspan=2, sticky="ew", pady=(0, 8)
         )
 
+        self.settings_cache_db_label = ttk.Label(frame)
+        self.settings_cache_db_label.grid(row=8, column=0, sticky="w", pady=(0, 8))
+        self.cache_db_var = tk.StringVar(value=str(cache_db_path()))
+        ttk.Entry(frame, textvariable=self.cache_db_var, state="readonly").grid(
+            row=8, column=1, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+
         self.settings_hint_label = ttk.Label(frame, wraplength=720)
-        self.settings_hint_label.grid(row=8, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        self.settings_hint_label.grid(row=9, column=0, columnspan=3, sticky="w", pady=(2, 10))
 
         self.settings_save_button = ttk.Button(frame, command=self._save_settings)
-        self.settings_save_button.grid(row=9, column=1, sticky="w")
+        self.settings_save_button.grid(row=10, column=1, sticky="w")
         self.settings_migrate_button = ttk.Button(frame, command=self._migrate_databases)
-        self.settings_migrate_button.grid(row=9, column=2, sticky="w", padx=(8, 0))
+        self.settings_migrate_button.grid(row=10, column=2, sticky="w", padx=(8, 0))
         self.settings_migrate_button.grid_remove()
         self.settings_restore_defaults_button = ttk.Button(frame, command=self._restore_default_settings)
-        self.settings_restore_defaults_button.grid(row=10, column=1, sticky="w", pady=(8, 0))
+        self.settings_restore_defaults_button.grid(row=11, column=1, sticky="w", pady=(8, 0))
 
         self.plugin_notebook.add(frame, text=self.context.t("settings.tab"))
         self.settings_tab_index = self.plugin_notebook.index("end") - 1
@@ -401,6 +418,7 @@ class PUtilsApp(tk.Tk):
         self.settings_language_label.configure(text=self.context.t("settings.language"))
         self.settings_timezone_label.configure(text=self.context.t("settings.timezone"))
         self.settings_log_retention_label.configure(text=self.context.t("settings.log_retention"))
+        self.settings_log_level_label.configure(text=self.context.t("settings.log_level"))
         self.settings_data_dir_label.configure(text=self.context.t("settings.data_dir"))
         self.settings_config_db_label.configure(text=self.context.t("settings.config_db"))
         self.settings_log_db_label.configure(text=self.context.t("settings.log_db"))
@@ -415,6 +433,8 @@ class PUtilsApp(tk.Tk):
         self.settings_hint_label.configure(text=hint)
         if self.settings_tab_index is not None:
             self.plugin_notebook.tab(self.settings_tab_index, text=self.context.t("settings.tab"))
+        if self.logs_tab_index is not None:
+            self.plugin_notebook.tab(self.logs_tab_index, text=self.context.t("logs.tab"))
 
     def _on_language_selected(self, _event=None) -> None:
         selected = self.language_var.get()
@@ -488,11 +508,17 @@ class PUtilsApp(tk.Tk):
         try:
             data_dir = self._target_data_dir()
             log_retention_limit = self._selected_log_retention_limit()
+            log_level = self.log_level_var.get().strip()
+            if log_level not in LOG_LEVELS:
+                log_level = DEFAULT_LOG_LEVEL
             data_dir.mkdir(parents=True, exist_ok=True)
             write_configured_data_dir(data_dir)
             self.config_store.set(APP_CONFIG_NAMESPACE, "configured_data_dir", str(data_dir))
             self.config_store.set(APP_CONFIG_NAMESPACE, "log_retention_limit", log_retention_limit)
+            self.config_store.set(APP_CONFIG_NAMESPACE, "log_level", log_level)
             self.log_retention_limit = log_retention_limit
+            self.log_level = log_level
+            self.context.min_log_level = log_level
             self.log_retention_var.set(str(log_retention_limit))
             self.log_store.set_retention_limit(log_retention_limit)
             self.log_store.rotate()
@@ -524,9 +550,12 @@ class PUtilsApp(tk.Tk):
             self.config_store.set(APP_CONFIG_NAMESPACE, "timezone", DEFAULT_TIMEZONE)
             self.config_store.set(APP_CONFIG_NAMESPACE, "configured_data_dir", str(default_data_dir))
             self.config_store.set(APP_CONFIG_NAMESPACE, "log_retention_limit", DEFAULT_LOG_RETENTION_LIMIT)
+            self.config_store.set(APP_CONFIG_NAMESPACE, "log_level", DEFAULT_LOG_LEVEL)
             self.translator.set_language(DEFAULT_LANGUAGE)
             self.display_timezone = DEFAULT_TIMEZONE
             self.log_retention_limit = DEFAULT_LOG_RETENTION_LIMIT
+            self.log_level = DEFAULT_LOG_LEVEL
+            self.context.min_log_level = DEFAULT_LOG_LEVEL
             self.log_store.set_retention_limit(DEFAULT_LOG_RETENTION_LIMIT)
             self.log_store.rotate()
         except Exception as exc:
@@ -535,6 +564,7 @@ class PUtilsApp(tk.Tk):
 
         self.timezone_var.set(DEFAULT_TIMEZONE)
         self.log_retention_var.set(str(DEFAULT_LOG_RETENTION_LIMIT))
+        self.log_level_var.set(DEFAULT_LOG_LEVEL)
         self.data_dir_var.set(str(default_data_dir))
         self.migrated_data_dir = None
         self._apply_language()
