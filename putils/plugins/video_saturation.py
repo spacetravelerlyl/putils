@@ -14,25 +14,40 @@ from tkinter import filedialog, messagebox, ttk
 
 from putils.plugin_api import DependencyStatus, PluginMetadata
 from putils.tk_utils import copy_treeview_selection_to_clipboard, open_in_file_manager
+from putils.database import utc_now_iso
 
 
 PLUGIN_ID = "video_saturation"
 CONFIG_NAMESPACE = "plugin.video_saturation"
+TASKS_TABLE = "plugin_video_saturation_tasks"
 CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {table_name} (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_path TEXT NOT NULL UNIQUE,
+    file_path TEXT NOT NULL,
     selected INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'pending',
     output_path TEXT,
     source_directory TEXT,
     error_message TEXT,
     error_details TEXT,
+    task_id TEXT DEFAULT '',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(file_path, task_id)
+)
+"""
+TASKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plugin_video_saturation_tasks (
+    task_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    video_count INTEGER NOT NULL DEFAULT 0,
+    completed_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running'
 )
 """
 DEFAULT_PARALLELISM = max(1, min(4, os.cpu_count() or 1))
+DEFAULT_TASK_RETENTION = 1000
 VIDEO_FILE_TYPES = (
     ("video_saturation.file_types.video", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
     ("video_saturation.file_types.all", "*.*"),
@@ -127,6 +142,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.output_paths: dict[str, Path] = {}
         self.source_directories: dict[str, Path] = {}
         self.error_details: dict[str, str] = {}
+        self.video_timing: dict[str, dict] = {}
         self.status_filter_var = tk.StringVar(value="all")
         self.detached_items: set[str] = set()
         self.output_dir = tk.StringVar(value=str(context.get_config(CONFIG_NAMESPACE, "output_dir", "")))
@@ -140,6 +156,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.running = False
         self.worker_thread: threading.Thread | None = None
         self.cancel_event = threading.Event()
+        self.pause_event = threading.Event()
         self.process_lock = threading.Lock()
         self.active_processes: set[subprocess.Popen] = set()
         self.run_generation = 0
@@ -163,6 +180,10 @@ class VideoSaturationPanel(ttk.Frame):
             default_device = saved_gpu_device
         self.gpu_device = tk.StringVar(value=default_device)
         self.gpu_status_text = tk.StringVar()
+        self.current_task_id: str = ""
+        self.current_task_files: list[Path] = []
+        self.task_filter_var = tk.StringVar(value="")
+        self.task_retention_limit = self._configured_task_retention()
 
         self._init_cache()
         self.grid(row=0, column=0, sticky="nsew")
@@ -227,6 +248,19 @@ class VideoSaturationPanel(ttk.Frame):
         self.gpu_device_combo = ttk.Combobox(controls, textvariable=self.gpu_device, state="readonly", width=40)
         self.gpu_device_combo.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
+        self.task_retention_label = ttk.Label(controls)
+        self.task_retention_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        self.task_retention_var = tk.IntVar(value=self.task_retention_limit)
+        self.task_retention_spinbox = ttk.Spinbox(
+            controls,
+            textvariable=self.task_retention_var,
+            from_=1,
+            to=999999,
+            width=8,
+            command=self._on_task_retention_change,
+        )
+        self.task_retention_spinbox.grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
         filter_frame = ttk.Frame(self)
         filter_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         self.status_filter_label = ttk.Label(filter_frame)
@@ -236,6 +270,14 @@ class VideoSaturationPanel(ttk.Frame):
         )
         self.status_filter_combo.grid(row=0, column=1)
         self.status_filter_combo.bind("<<ComboboxSelected>>", self._apply_status_filter)
+
+        self.task_filter_label = ttk.Label(filter_frame)
+        self.task_filter_label.grid(row=0, column=2, padx=(16, 4))
+        self.task_filter_combo = ttk.Combobox(
+            filter_frame, textvariable=self.task_filter_var, state="readonly", width=28
+        )
+        self.task_filter_combo.grid(row=0, column=3)
+        self.task_filter_combo.bind("<<ComboboxSelected>>", self._on_task_filter_selected)
 
         actions = ttk.Frame(self)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -254,7 +296,12 @@ class VideoSaturationPanel(ttk.Frame):
         self.stop_button = ttk.Button(actions, command=self._stop_run)
         self.stop_button.grid(row=0, column=6, padx=(6, 0))
         self.stop_button.configure(state=tk.DISABLED)
-        ttk.Label(actions, textvariable=self.status).grid(row=0, column=7, sticky="w", padx=(12, 0))
+        self.pause_button = ttk.Button(actions, command=self._toggle_pause)
+        self.pause_button.grid(row=0, column=7, padx=(6, 0))
+        self.pause_button.configure(state=tk.DISABLED)
+        self.clear_history_button = ttk.Button(actions, command=self._clear_task_history)
+        self.clear_history_button.grid(row=0, column=8, padx=(18, 0))
+        ttk.Label(actions, textvariable=self.status).grid(row=0, column=9, sticky="w", padx=(12, 0))
 
         progress_frame = ttk.Frame(self)
         progress_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
@@ -327,12 +374,27 @@ class VideoSaturationPanel(ttk.Frame):
         self.ratio_label.configure(text=f"{value:.2f}")
         self.context.set_config(CONFIG_NAMESPACE, "saturation", value)
 
+    def _on_task_retention_change(self) -> None:
+        value = self.task_retention_var.get()
+        if value < 1:
+            return
+        self.task_retention_limit = value
+        self.context.set_config(CONFIG_NAMESPACE, "task_retention", value)
+
     def _configured_parallelism(self) -> int:
         value = self.context.get_config(CONFIG_NAMESPACE, "parallelism", DEFAULT_PARALLELISM)
         try:
             parsed = int(value)
         except (TypeError, ValueError):
             return DEFAULT_PARALLELISM
+        return max(1, parsed)
+
+    def _configured_task_retention(self) -> int:
+        value = self.context.get_config(CONFIG_NAMESPACE, "task_retention", DEFAULT_TASK_RETENTION)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_TASK_RETENTION
         return max(1, parsed)
 
     def _selected_parallelism(self) -> int:
@@ -596,14 +658,35 @@ class VideoSaturationPanel(ttk.Frame):
         self.output_paths.clear()
         self.source_directories.clear()
         self.error_details.clear()
+        self.video_timing.clear()
         self.detached_items.clear()
-        self.context.cache_store.clear(PLUGIN_ID)
+        self.current_task_id = ""
+        self.current_task_files.clear()
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
         self.progress.set(0)
         self.progress_text.set("0%")
         self._redraw_progress("#9ca3af")
         self._set_status("video_saturation.ready")
+        self.task_filter_var.set(self.context.t("video_saturation.task_filter.all"))
+        self._update_task_filter_combobox()
+
+    def _clear_task_history(self) -> None:
+        if self.running and self.worker_thread is not None and self.worker_thread.is_alive():
+            return
+        for step in range(1, 4):
+            confirmed = messagebox.askyesno(
+                self.context.t("video_saturation.clear_history.confirm.title", step=step),
+                self.context.t("video_saturation.clear_history.confirm.message", step=step),
+                parent=self,
+            )
+            if not confirmed:
+                return
+        self._clear_files()
+        self.context.cache_store.execute(f"DELETE FROM {TASKS_TABLE}")
+        self.context.cache_store.execute(f"DELETE FROM plugin_{PLUGIN_ID}")
+        self.task_filter_var.set("")
+        self._update_task_filter_combobox()
 
     def _run(self) -> None:
         if self.running:
@@ -651,6 +734,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.run_generation += 1
         generation = self.run_generation
         self.cancel_event.clear()
+        self.pause_event.clear()
         self.context.set_config(CONFIG_NAMESPACE, "output_dir", output_dir)
         self.context.set_config(CONFIG_NAMESPACE, "parallelism", parallelism)
         self.context.set_config(CONFIG_NAMESPACE, "gpu_mode", gpu_mode)
@@ -658,14 +742,21 @@ class VideoSaturationPanel(ttk.Frame):
         self.running = True
         self.run_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
+        self.pause_button.configure(state=tk.NORMAL)
         self.progress.set(0)
         self.progress_text.set("0%")
         self._redraw_progress("#2563eb")
         self._set_status("video_saturation.running")
         saturation = round(float(self.saturation.get()), 2)
+        task_id = self._generate_task_id(len(files))
+        self.current_task_id = task_id
+        self.current_task_files = list(files)
+        self._create_task(task_id, len(files))
+        self._prune_old_tasks()
+        self._update_task_filter_combobox()
         self.worker_thread = threading.Thread(
             target=self._run_worker,
-            args=(ffmpeg_path, saturation, output_dir, files, generation, parallelism, gpu_mode, gpu_device),
+            args=(ffmpeg_path, saturation, output_dir, files, generation, parallelism, gpu_mode, gpu_device, task_id),
             daemon=True,
         )
         self.worker_thread.start()
@@ -680,88 +771,131 @@ class VideoSaturationPanel(ttk.Frame):
         parallelism: int,
         gpu_mode: str,
         gpu_device: str,
+        task_id: str,
     ) -> None:
+        from collections import deque
+        from datetime import datetime as _datetime, timezone as _timezone
+        task_start_monotonic = time.monotonic()
+        task_start_time = _datetime.now(_timezone.utc)
         total = len(files)
         completed = 0
         processed = 0
         gpu_error_seen = False
+        pending = deque(files)
+        futures: dict = {}
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
-            futures = {}
-            for input_path in files:
-                self._set_item_status(input_path, "video_saturation.running", generation)
-                output_path = self._output_path_for(input_path, output_dir)
-                futures[
-                    executor.submit(
-                        self._process_video,
-                        ffmpeg_path,
-                        input_path,
-                        output_path,
-                        saturation,
-                        gpu_mode,
-                        gpu_device,
-                        parallelism,
-                    )
-                ] = (input_path, output_path)
-
-            for future in as_completed(futures):
-                if self.cancel_event.is_set():
-                    for pending in futures:
-                        pending.cancel()
-                input_path, output_path = futures[future]
-                try:
-                    future.result()
-                except subprocess.CalledProcessError as exc:
-                    if self.cancel_event.is_set():
-                        self._set_item_status(input_path, "video_saturation.failed", generation)
-                        continue
-                    stderr = (exc.stderr or "").strip()[-2000:]
-                    timing = getattr(exc, "_timing", {})
-                    error_info = {
-                        "input": str(input_path),
-                        "output": str(output_path),
-                        "stderr": stderr,
-                        **timing,
-                    }
-                    if gpu_mode != "off" and not gpu_error_seen and self._is_gpu_error(stderr):
-                        gpu_error_seen = True
-                        error_info["gpu_hint"] = self.context.t("video_saturation.gpu.error_hint", mode=gpu_mode)
-                    self.error_details[str(input_path)] = json.dumps(error_info)
-                    self._set_item_status(input_path, "video_saturation.failed", generation)
-                except Exception as exc:
-                    if self.cancel_event.is_set() and str(exc) == "cancelled":
-                        self._set_item_status(input_path, "video_saturation.failed", generation)
-                        continue
-                    error_info = {"input": str(input_path), "output": str(output_path), "error": str(exc)}
-                    self.error_details[str(input_path)] = json.dumps(error_info)
-                    self.context.log(
-                        PLUGIN_ID,
-                        "ERROR",
-                        "Saturation adjustment failed",
-                        error_info,
-                    )
-                    self._set_item_status(input_path, "video_saturation.failed", generation)
-                else:
-                    completed += 1
-                    self._set_item_completed(input_path, output_path, generation)
-                processed += 1
-                self.after(0, self._update_progress, processed, total, "#2563eb", generation)
-                self.after(
-                    0,
-                    partial(
-                        self._set_status,
-                        "video_saturation.progress_text",
-                        generation,
-                        completed=completed,
-                        total=total,
-                    ),
+            for _ in range(min(parallelism, len(pending))):
+                self._submit_one(
+                    executor, futures, pending,
+                    ffmpeg_path, saturation, output_dir,
+                    gpu_mode, gpu_device, parallelism,
+                    generation, task_id,
                 )
+
+            while futures:
+                for future in as_completed(futures):
+                    input_path, output_path = futures.pop(future)
+                    try:
+                        future.result()
+                    except subprocess.CalledProcessError as exc:
+                        if self.cancel_event.is_set():
+                            self._set_item_status(input_path, "video_saturation.failed", generation)
+                            break
+                        stderr = (exc.stderr or "").strip()[-2000:]
+                        timing = getattr(exc, "_timing", {})
+                        error_info = {
+                            "input": str(input_path),
+                            "output": str(output_path),
+                            "stderr": stderr,
+                            **timing,
+                        }
+                        if gpu_mode != "off" and not gpu_error_seen and self._is_gpu_error(stderr):
+                            gpu_error_seen = True
+                            error_info["gpu_hint"] = self.context.t("video_saturation.gpu.error_hint", mode=gpu_mode)
+                        self.error_details[str(input_path)] = json.dumps(error_info)
+                        self._set_item_status(input_path, "video_saturation.failed", generation)
+                    except Exception as exc:
+                        if self.cancel_event.is_set() and str(exc) == "cancelled":
+                            self._set_item_status(input_path, "video_saturation.failed", generation)
+                            break
+                        error_info = {"input": str(input_path), "output": str(output_path), "error": str(exc)}
+                        self.error_details[str(input_path)] = json.dumps(error_info)
+                        self.context.log(
+                            PLUGIN_ID,
+                            "ERROR",
+                            "Saturation adjustment failed",
+                            error_info,
+                        )
+                        self._set_item_status(input_path, "video_saturation.failed", generation)
+                    else:
+                        completed += 1
+                        self._set_item_completed(input_path, output_path, generation)
+                    processed += 1
+                    self.after(0, self._update_progress, processed, total, "#2563eb", generation)
+                    self.after(
+                        0,
+                        partial(
+                            self._set_status,
+                            "video_saturation.progress_text",
+                            generation,
+                            completed=completed,
+                            total=total,
+                        ),
+                    )
+                    break
+
+                if self.cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    while pending:
+                        input_path = pending.popleft()
+                        self._set_item_status(input_path, "video_saturation.failed", generation)
+                        processed += 1
+                    break
+
+                while self.pause_event.is_set() and not self.cancel_event.is_set():
+                    self.after(0, self._set_status, "video_saturation.paused", generation)
+                    time.sleep(0.2)
+
+                if not self.pause_event.is_set() and pending:
+                    self.after(0, self._set_status, "video_saturation.running", generation)
+                    self._submit_one(
+                        executor, futures, pending,
+                        ffmpeg_path, saturation, output_dir,
+                        gpu_mode, gpu_device, parallelism,
+                        generation, task_id,
+                    )
 
         if gpu_error_seen:
             self.after(0, lambda: messagebox.showwarning(
                 self.context.t("video_saturation.gpu.error_detected.title"),
                 self.context.t("video_saturation.gpu.error_detected.message", mode=gpu_mode),
             ))
-        self.after(0, self._finish_run, completed, total, generation, self.cancel_event.is_set())
+        self.after(0, self._finish_run, completed, total, generation, self.cancel_event.is_set(), task_start_time, task_start_monotonic)
+
+    def _submit_one(
+        self,
+        executor, futures, pending,
+        ffmpeg_path, saturation, output_dir,
+        gpu_mode, gpu_device, parallelism,
+        generation, task_id,
+    ) -> None:
+        input_path = pending.popleft()
+        self._set_item_status(input_path, "video_saturation.running", generation)
+        self._tag_video_task_id(input_path, task_id)
+        output_path = self._output_path_for(input_path, output_dir, task_id)
+        futures[
+            executor.submit(
+                self._process_video,
+                ffmpeg_path,
+                input_path,
+                output_path,
+                saturation,
+                gpu_mode,
+                gpu_device,
+                parallelism,
+            )
+        ] = (input_path, output_path)
 
     def _process_video(
         self,
@@ -815,7 +949,9 @@ class VideoSaturationPanel(ttk.Frame):
             "start_time": start_time.isoformat(timespec="milliseconds"),
             "end_time": end_time.isoformat(timespec="milliseconds"),
             "duration": self._format_elapsed(elapsed),
+            "duration_seconds": round(elapsed, 2),
         }
+        self.video_timing[str(input_path)] = timing
         if self.cancel_event.is_set():
             raise RuntimeError("cancelled")
         if process.returncode != 0:
@@ -837,19 +973,6 @@ class VideoSaturationPanel(ttk.Frame):
             exc = subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
             exc._timing = timing
             raise exc
-        self.context.log(
-            PLUGIN_ID,
-            "INFO",
-            "Saturation adjustment completed",
-            {
-                "input": str(input_path),
-                "output": str(output_path),
-                "saturation": saturation,
-                "gpu_mode": gpu_mode,
-                "gpu_device": gpu_device,
-                **timing,
-            },
-        )
 
     def _selected_gpu_mode(self) -> str:
         mode = self.gpu_mode.get().strip()
@@ -868,15 +991,27 @@ class VideoSaturationPanel(ttk.Frame):
         if not self.running:
             return
         self.cancel_event.set()
+        self.pause_event.clear()
         with self.process_lock:
             processes = list(self.active_processes)
         for process in processes:
             if process.poll() is None:
                 process.terminate()
         self.stop_button.configure(state=tk.DISABLED)
+        self.pause_button.configure(state=tk.DISABLED)
         self._set_status("video_saturation.stopping")
 
-    def _output_path_for(self, input_path: Path, output_dir: str) -> Path:
+    def _toggle_pause(self) -> None:
+        if not self.running:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            self.pause_button.configure(text=self.context.t("video_saturation.pause"))
+        else:
+            self.pause_event.set()
+            self.pause_button.configure(text=self.context.t("video_saturation.resume"))
+
+    def _output_path_for(self, input_path: Path, output_dir: str, task_id: str) -> Path:
         source_directory = self.source_directories.get(str(input_path))
         if source_directory is not None:
             target_root = (
@@ -884,12 +1019,12 @@ class VideoSaturationPanel(ttk.Frame):
                 if output_dir
                 else source_directory.parent
             )
-            directory = target_root / f"{source_directory.name}_saturation_adjusted"
+            directory = target_root / f"{source_directory.name}_{task_id}"
             relative_parent = input_path.parent.relative_to(source_directory)
             directory = directory / relative_parent
         else:
             directory = Path(output_dir).expanduser().resolve() if output_dir else input_path.parent
-        return directory / f"{input_path.stem}_saturation_adjusted{input_path.suffix}"
+        return directory / f"{input_path.stem}_{task_id}{input_path.suffix}"
 
     def _set_item_status(self, input_path: Path, status_key: str, generation: int | None = None) -> None:
         def update() -> None:
@@ -1265,18 +1400,77 @@ class VideoSaturationPanel(ttk.Frame):
             value = value.replace(source, target)
         return value
 
-    def _finish_run(self, completed: int, total: int, generation: int, cancelled: bool = False) -> None:
+    def _finish_run(self, completed: int, total: int, generation: int, cancelled: bool = False, task_start_time=None, task_start_monotonic: float = 0) -> None:
         if generation != self.run_generation:
             return
         self.running = False
+        self.pause_event.clear()
         self.run_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
+        self.pause_button.configure(state=tk.DISABLED)
+        self.pause_button.configure(text=self.context.t("video_saturation.pause"))
         self._update_progress(total if not cancelled else completed, total, "#16a34a" if completed == total and not cancelled else "#dc2626", generation)
         if cancelled:
             self._set_status("video_saturation.cancelled", generation, completed=completed, total=total)
+            task_status = "cancelled"
         else:
             self._set_status("video_saturation.finished", generation, completed=completed, total=total)
+            task_status = "completed"
+        failed = total - completed
+        task_id = self.current_task_id
+        if task_id:
+            self._update_task_status(task_id, completed, failed, task_status)
+            task_end_time = None
+            task_elapsed = ""
+            if task_start_time is not None:
+                from datetime import datetime as _datetime, timezone as _timezone
+                task_end_time = _datetime.now(_timezone.utc)
+                task_elapsed = self._format_elapsed(time.monotonic() - task_start_monotonic)
+            self.context.log(
+                PLUGIN_ID,
+                "INFO",
+                self.context.t("video_saturation.task_batch_log"),
+                {
+                    "task_id": task_id,
+                    "completed": completed,
+                    "failed": failed,
+                    "total": total,
+                    "cancelled": cancelled,
+                    "gpu_mode": self.gpu_mode.get(),
+                    "gpu_device": self.gpu_device.get(),
+                    "parallelism": self.parallelism.get(),
+                    "saturation": round(float(self.saturation.get()), 2),
+                    "task_start_time": task_start_time.isoformat(timespec="milliseconds") if task_start_time else None,
+                    "task_end_time": task_end_time.isoformat(timespec="milliseconds") if task_end_time else None,
+                    "task_duration": task_elapsed,
+                    "files": self._collect_file_statuses(),
+                },
+            )
         self._save_to_cache()
+        self.current_task_id = ""
+        self.current_task_files.clear()
+        self.video_timing.clear()
+
+    def _collect_file_statuses(self) -> list[dict]:
+        result: list[dict] = []
+        for f in self.current_task_files:
+            iid = str(f)
+            entry: dict = {
+                "path": str(f),
+                "status": self.item_status_keys.get(iid, "unknown"),
+            }
+            timing = self.video_timing.get(iid)
+            if timing:
+                entry["start_time"] = timing["start_time"]
+                entry["end_time"] = timing["end_time"]
+                entry["duration"] = timing["duration"]
+            if iid in self.error_details:
+                try:
+                    entry["error"] = json.loads(self.error_details[iid])
+                except Exception:
+                    entry["error"] = self.error_details[iid]
+            result.append(entry)
+        return result
 
     def _update_progress(
         self,
@@ -1326,6 +1520,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.gpu_mode_combo.configure(values=self.gpu_modes, state="readonly")
         self.gpu_mode.set(self._selected_gpu_mode())
         self.gpu_device_combo.configure(values=self.gpu_device_labels, state="readonly" if self.gpu_devices else tk.DISABLED)
+        self.task_retention_label.configure(text=self.context.t("video_saturation.task_retention"))
         self.browse_button.configure(text=self.context.t("video_saturation.browse"))
         self.add_button.configure(text=self.context.t("video_saturation.add_videos"))
         self.add_directory_button.configure(text=self.context.t("video_saturation.add_directory"))
@@ -1334,6 +1529,11 @@ class VideoSaturationPanel(ttk.Frame):
         self.deselect_all_button.configure(text=self.context.t("video_saturation.deselect_all"))
         self.run_button.configure(text=self.context.t("video_saturation.run"))
         self.stop_button.configure(text=self.context.t("video_saturation.stop"))
+        if self.pause_event.is_set():
+            self.pause_button.configure(text=self.context.t("video_saturation.resume"))
+        else:
+            self.pause_button.configure(text=self.context.t("video_saturation.pause"))
+        self.clear_history_button.configure(text=self.context.t("video_saturation.clear_history"))
         self.progress_label.configure(text=self.context.t("video_saturation.progress"))
         self.status_filter_label.configure(text=self.context.t("video_saturation.filter.status"))
         self.status_filter_combo.configure(values=[
@@ -1344,6 +1544,8 @@ class VideoSaturationPanel(ttk.Frame):
             self.context.t("video_saturation.failed"),
         ])
         self.status_filter_var.set(self.context.t("video_saturation.filter.all"))
+        self.task_filter_label.configure(text=self.context.t("video_saturation.task_filter"))
+        self._update_task_filter_combobox()
         self.file_tree.heading("path", text=self.context.t("video_saturation.video"))
         self.file_tree.heading("status", text=self.context.t("video_saturation.status"))
         self.status.set(self.context.t(self.status_key, **self.status_kwargs))
@@ -1354,15 +1556,74 @@ class VideoSaturationPanel(ttk.Frame):
                 self.file_tree.set(item_id, "status", self.context.t(status_key))
 
     def _init_cache(self) -> None:
+        import sqlite3
         self.context.cache_store.ensure_plugin_table(PLUGIN_ID, CACHE_SCHEMA)
+        try:
+            self.context.cache_store.execute(
+                f"ALTER TABLE plugin_{PLUGIN_ID} ADD COLUMN task_id TEXT DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+        self._migrate_cache_unique_constraint()
+        self.context.cache_store.execute(TASKS_SCHEMA)
+        self.context.cache_store.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_plugin_{PLUGIN_ID}_task_id "
+            f"ON plugin_{PLUGIN_ID}(task_id)"
+        )
+
+    def _migrate_cache_unique_constraint(self) -> None:
+        table_name = f"plugin_{PLUGIN_ID}"
+        rows = self.context.cache_store.query(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        )
+        create_sql = (rows[0]["sql"] if rows else "") or ""
+        if "file_path TEXT NOT NULL UNIQUE" not in create_sql:
+            return
+        self.context.cache_store.execute(
+            f"UPDATE {table_name} SET task_id = '' WHERE task_id IS NULL"
+        )
+        self.context.cache_store.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.context.cache_store.execute(
+                f"CREATE TABLE {table_name}_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "file_path TEXT NOT NULL, "
+                "selected INTEGER NOT NULL DEFAULT 1, "
+                "status TEXT NOT NULL DEFAULT 'pending', "
+                "output_path TEXT, "
+                "source_directory TEXT, "
+                "error_message TEXT, "
+                "error_details TEXT, "
+                "task_id TEXT DEFAULT '', "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "UNIQUE(file_path, task_id)"
+                ")"
+            )
+            self.context.cache_store.execute(
+                f"INSERT INTO {table_name}_new SELECT * FROM {table_name}"
+            )
+            self.context.cache_store.execute(f"DROP TABLE {table_name}")
+            self.context.cache_store.execute(
+                f"ALTER TABLE {table_name}_new RENAME TO {table_name}"
+            )
+        finally:
+            self.context.cache_store.execute("PRAGMA foreign_keys = ON")
 
     def _restore_from_cache(self) -> None:
-        rows = self.context.cache_store.get_all(PLUGIN_ID)
+        rows = self.context.cache_store.query(
+            f"SELECT * FROM plugin_{PLUGIN_ID} WHERE task_id IS NULL OR task_id = '' "
+            f"OR task_id IN (SELECT task_id FROM {TASKS_TABLE} WHERE status = 'running') "
+            f"ORDER BY task_id DESC"
+        )
         for row in rows:
             file_path = Path(row["file_path"])
+            iid = str(file_path)
+            if iid in self.item_status_keys:
+                continue
             if not file_path.exists():
                 continue
-            iid = str(file_path)
             self.files.append(file_path)
             self.selected_items[iid] = bool(row["selected"])
             self.item_status_keys[iid] = row["status"]
@@ -1382,21 +1643,147 @@ class VideoSaturationPanel(ttk.Frame):
             )
         if self.files:
             self._set_status("video_saturation.selected", count=len(self.files))
+        self._update_task_filter_combobox()
 
     def _save_to_cache(self) -> None:
-        from datetime import datetime, timezone
+        task_file_set = {str(p) for p in self.current_task_files}
+        table_name = f"plugin_{PLUGIN_ID}"
         for file_path in self.files:
             iid = str(file_path)
-            self.context.cache_store.upsert(
-                PLUGIN_ID,
-                str(file_path),
-                selected=1 if self.selected_items.get(iid, True) else 0,
-                status=self.item_status_keys.get(iid, "video_saturation.pending"),
-                output_path=str(self.output_paths.get(iid, "")),
-                source_directory=str(self.source_directories.get(iid, "")),
-                error_message="",
-                error_details=self.error_details.get(iid, ""),
-                created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            if self.current_task_id and iid not in task_file_set:
+                continue
+            task_id = self.current_task_id if iid in task_file_set else ""
+            self.context.cache_store.execute(
+                f"INSERT INTO {table_name} "
+                "(file_path, selected, status, output_path, source_directory, "
+                "error_message, error_details, task_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(file_path, task_id) DO UPDATE SET "
+                "selected = excluded.selected, "
+                "status = excluded.status, "
+                "output_path = excluded.output_path, "
+                "source_directory = excluded.source_directory, "
+                "error_message = excluded.error_message, "
+                "error_details = excluded.error_details, "
+                "updated_at = excluded.updated_at",
+                (
+                    str(file_path),
+                    1 if self.selected_items.get(iid, True) else 0,
+                    self.item_status_keys.get(iid, "video_saturation.pending"),
+                    str(self.output_paths.get(iid, "")),
+                    str(self.source_directories.get(iid, "")),
+                    "",
+                    self.error_details.get(iid, ""),
+                    task_id,
+                    utc_now_iso(),
+                    utc_now_iso(),
+                ),
+            )
+
+    # ── Task ID & task management ──────────────────────────────────
+
+    def _generate_task_id(self, video_count: int) -> str:
+        from datetime import datetime
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        return f"{timestamp}_{video_count}"
+
+    def _create_task(self, task_id: str, video_count: int) -> None:
+        self.context.cache_store.execute(
+            f"INSERT INTO {TASKS_TABLE}(task_id, created_at, video_count, status) VALUES (?, ?, ?, 'running')",
+            (task_id, utc_now_iso(), video_count),
+        )
+
+    def _update_task_status(self, task_id: str, completed: int, failed: int, status: str) -> None:
+        self.context.cache_store.execute(
+            f"UPDATE {TASKS_TABLE} SET completed_count=?, failed_count=?, status=? WHERE task_id=?",
+            (completed, failed, status, task_id),
+        )
+
+    def _load_task_ids(self) -> list[str]:
+        rows = self.context.cache_store.query(
+            f"SELECT task_id FROM {TASKS_TABLE} ORDER BY created_at DESC"
+        )
+        return [row["task_id"] for row in rows]
+
+    def _load_videos_by_task(self, task_id: str) -> list:
+        return self.context.cache_store.query(
+            f"SELECT * FROM plugin_{PLUGIN_ID} WHERE task_id = ?",
+            (task_id,),
+        )
+
+    def _update_task_filter_combobox(self) -> None:
+        task_ids = self._load_task_ids()
+        all_label = self.context.t("video_saturation.task_filter.all")
+        values = [all_label] + task_ids
+        self.task_filter_combo.configure(values=values)
+        current = self.task_filter_var.get()
+        if not task_ids:
+            self.task_filter_var.set("")
+        elif not current or current not in values:
+            self.task_filter_var.set(all_label)
+
+    def _on_task_filter_selected(self, event=None) -> None:
+        selected = self.task_filter_var.get()
+        for item_id in self.file_tree.get_children():
+            self.file_tree.delete(item_id)
+        self.detached_items.clear()
+        if not selected or selected == self.context.t("video_saturation.task_filter.all"):
+            rows = self.context.cache_store.query(
+                f"SELECT * FROM plugin_{PLUGIN_ID} "
+                f"WHERE id IN (SELECT MAX(id) FROM plugin_{PLUGIN_ID} GROUP BY file_path)"
+            )
+        else:
+            rows = self._load_videos_by_task(selected)
+        for row in rows:
+            file_path = Path(row["file_path"])
+            if not file_path.exists():
+                continue
+            iid = str(file_path)
+            if self.file_tree.exists(iid):
+                continue
+            selected_text = "☑" if self.selected_items.get(iid, True) else "☐"
+            status_key = row["status"] if row["status"] else "video_saturation.pending"
+            self.item_status_keys[iid] = status_key
+            if row["output_path"]:
+                self.output_paths[iid] = Path(row["output_path"])
+            if row["source_directory"]:
+                self.source_directories[iid] = Path(row["source_directory"])
+            if row["error_details"]:
+                self.error_details[iid] = row["error_details"]
+            self.file_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(selected_text, str(file_path), self.context.t(status_key)),
+            )
+        self._apply_status_filter()
+
+    def _tag_video_task_id(self, input_path: Path, task_id: str) -> None:
+        self.context.cache_store.execute(
+            f"DELETE FROM plugin_{PLUGIN_ID} WHERE file_path = ? AND task_id = ?",
+            (str(input_path), task_id),
+        )
+        self.context.cache_store.execute(
+            f"UPDATE plugin_{PLUGIN_ID} SET task_id = ? WHERE file_path = ? AND task_id = ''",
+            (task_id, str(input_path)),
+        )
+
+    def _prune_old_tasks(self) -> None:
+        tasks = self.context.cache_store.query(
+            f"SELECT task_id FROM {TASKS_TABLE} ORDER BY created_at DESC"
+        )
+        if len(tasks) <= self.task_retention_limit:
+            return
+        stale_ids = [row["task_id"] for row in tasks[self.task_retention_limit:]]
+        for task_id in stale_ids:
+            self.context.cache_store.execute(
+                f"DELETE FROM plugin_{PLUGIN_ID} WHERE task_id = ?",
+                (task_id,),
+            )
+            self.context.cache_store.execute(
+                f"DELETE FROM {TASKS_TABLE} WHERE task_id = ?",
+                (task_id,),
             )
 
     def _process_selected(self) -> None:

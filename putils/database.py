@@ -262,3 +262,11 @@ class CacheStore:
         table_name = f"plugin_{plugin_id}"
         with self.connect() as conn:
             conn.execute(f"DELETE FROM {table_name}")
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        with self.connect() as conn:
+            conn.execute(sql, params)
+
+    def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(conn.execute(sql, params).fetchall())
