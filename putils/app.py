@@ -236,6 +236,7 @@ class PUtilsApp(tk.Tk):
             for plugin in self.plugins:
                 frame = ttk.Frame(self.plugin_notebook, padding=12)
                 frame.columnconfigure(0, weight=1)
+                frame.rowconfigure(0, weight=1)
                 panel = plugin.build(frame, self.context)
                 self.plugin_panels.append(panel)
                 self.plugin_notebook.add(
