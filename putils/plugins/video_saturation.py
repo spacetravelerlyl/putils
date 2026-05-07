@@ -179,6 +179,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.gpu_device = tk.StringVar(value=default_device)
         self.gpu_status_text = tk.StringVar()
         self.current_task_id: str = ""
+        self.current_task_files: list[Path] = []
         self.task_filter_var = tk.StringVar(value="")
 
         self._init_cache()
@@ -624,6 +625,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.video_timing.clear()
         self.detached_items.clear()
         self.current_task_id = ""
+        self.current_task_files.clear()
         self.context.cache_store.clear(PLUGIN_ID)
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
@@ -693,6 +695,7 @@ class VideoSaturationPanel(ttk.Frame):
         saturation = round(float(self.saturation.get()), 2)
         task_id = self._generate_task_id(len(files))
         self.current_task_id = task_id
+        self.current_task_files = list(files)
         self._create_task(task_id, len(files))
         self._update_task_filter_combobox()
         self.worker_thread = threading.Thread(
@@ -1338,7 +1341,7 @@ class VideoSaturationPanel(ttk.Frame):
 
     def _collect_file_statuses(self) -> list[dict]:
         result: list[dict] = []
-        for f in self.files:
+        for f in self.current_task_files:
             iid = str(f)
             entry: dict = {
                 "path": str(f),
@@ -1478,6 +1481,7 @@ class VideoSaturationPanel(ttk.Frame):
         self._update_task_filter_combobox()
 
     def _save_to_cache(self) -> None:
+        task_file_set = {str(p) for p in self.current_task_files}
         for file_path in self.files:
             iid = str(file_path)
             self.context.cache_store.upsert(
@@ -1489,7 +1493,7 @@ class VideoSaturationPanel(ttk.Frame):
                 source_directory=str(self.source_directories.get(iid, "")),
                 error_message="",
                 error_details=self.error_details.get(iid, ""),
-                task_id=self.current_task_id,
+                task_id=self.current_task_id if iid in task_file_set else "",
                 created_at=utc_now_iso(),
             )
 
