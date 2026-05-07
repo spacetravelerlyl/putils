@@ -318,7 +318,7 @@ class VideoSaturationPanel(ttk.Frame):
 
     def _detect_gpu_info(self) -> dict[str, object]:
         ffmpeg_path = shutil.which("ffmpeg")
-        hwaccels: list[str] = []
+        raw_hwaccels: list[str] = []
         if ffmpeg_path:
             try:
                 result = subprocess.run(
@@ -328,14 +328,45 @@ class VideoSaturationPanel(ttk.Frame):
                     text=True,
                     timeout=5,
                 )
-                hwaccels = [
+                raw_hwaccels = [
                     line.strip()
                     for line in result.stdout.splitlines()
                     if line.strip() and not line.lower().startswith("hardware acceleration")
                 ]
             except Exception:
-                hwaccels = []
+                raw_hwaccels = []
 
+        gpu_devices = self._detect_gpu_devices()
+        nvidia_detected = any("nvidia" in d.get("label", "").lower() for d in gpu_devices)
+
+        validated_hwaccels: list[str] = []
+        if ffmpeg_path:
+            for hw in raw_hwaccels:
+                if hw == "cuda" and not nvidia_detected:
+                    continue
+                if self._validate_hwaccel(ffmpeg_path, hw):
+                    validated_hwaccels.append(hw)
+
+        if gpu_devices:
+            summary = "; ".join(d["label"] for d in gpu_devices)
+        elif validated_hwaccels:
+            summary = self.context.t(
+                "video_saturation.gpu.detected_hwaccels",
+                values=", ".join(validated_hwaccels),
+            )
+        else:
+            summary = self.context.t("video_saturation.gpu.not_found")
+
+        return {
+            "available": len(validated_hwaccels) > 0,
+            "summary": summary,
+            "hwaccel": validated_hwaccels[0] if validated_hwaccels else None,
+            "hwaccels": validated_hwaccels,
+            "devices": gpu_devices,
+        }
+
+    def _detect_gpu_devices(self) -> list[dict[str, str]]:
+        import platform as _platform
         if shutil.which("nvidia-smi"):
             try:
                 result = subprocess.run(
@@ -351,17 +382,33 @@ class VideoSaturationPanel(ttk.Frame):
                 )
                 gpus = [line.strip() for line in result.stdout.splitlines() if line.strip()]
                 if gpus:
-                    devices = [
+                    return [
                         {"label": f"GPU {index}: {line}", "value": str(index)}
                         for index, line in enumerate(gpus)
                     ]
-                    return {
-                        "available": True,
-                        "summary": "; ".join(gpus),
-                        "hwaccel": "cuda" if "cuda" in hwaccels else "auto",
-                        "hwaccels": hwaccels,
-                        "devices": devices,
-                    }
+            except Exception:
+                pass
+
+        if _platform.system() == "Windows":
+            try:
+                result = subprocess.run(
+                    ["wmic", "path", "win32_VideoController", "get", "name", "/format:csv"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                devices: list[dict[str, str]] = []
+                for line in result.stdout.splitlines():
+                    line = line.strip()
+                    if not line or line.lower().startswith("node,name") or line.lower().startswith("name"):
+                        continue
+                    parts = line.split(",", 1)
+                    name = parts[-1].strip()
+                    if name and not name.lower().startswith("microsoft basic"):
+                        devices.append({"label": name, "value": str(len(devices))})
+                if devices:
+                    return devices
             except Exception:
                 pass
 
@@ -377,35 +424,60 @@ class VideoSaturationPanel(ttk.Frame):
                 matches = [
                     line.strip()
                     for line in result.stdout.splitlines()
-                    if any(token in line.lower() for token in ("vga", "3d controller", "display controller"))
+                    if any(
+                        token in line.lower()
+                        for token in ("vga", "3d controller", "display controller")
+                    )
                 ]
-                if matches and hwaccels:
-                    return {
-                        "available": True,
-                        "summary": "; ".join(matches[:2]),
-                        "hwaccel": "auto",
-                        "hwaccels": hwaccels,
-                        "devices": [],
-                    }
+                if matches:
+                    return [
+                        {"label": line, "value": str(i)}
+                        for i, line in enumerate(matches)
+                    ]
             except Exception:
                 pass
 
-        if hwaccels:
-            return {
-                "available": True,
-                "summary": self.context.t("video_saturation.gpu.detected_hwaccels", values=", ".join(hwaccels)),
-                "hwaccel": "auto",
-                "hwaccels": hwaccels,
-                "devices": [],
-            }
+        return []
 
-        return {
-            "available": False,
-            "summary": self.context.t("video_saturation.gpu.not_found"),
-            "hwaccel": None,
-            "hwaccels": [],
-            "devices": [],
-        }
+    def _validate_hwaccel(self, ffmpeg_path: str, hwaccel: str) -> bool:
+        try:
+            subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-hwaccel", hwaccel,
+                    "-f", "lavfi",
+                    "-i", "color=black:size=2x2:rate=1",
+                    "-frames:v", "1",
+                    "-f", "null", "-",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_gpu_error(stderr: str) -> bool:
+        markers = (
+            "Cannot load",
+            "Could not dynamically load",
+            "No device available for decoder",
+            "Hardware device setup failed",
+            "Device creation failed",
+            "Failed to create hardware",
+            "No hardware device found",
+            "Cannot open",
+            "No VA display found",
+            "Cannot initialize hardware decoder",
+            "Failed to initialise VAAPI connection",
+            "DRM",
+        )
+        stderr_lower = stderr.lower()
+        return any(m.lower() in stderr_lower for m in markers)
 
     def _gpu_status_display_text(self) -> str:
         summary = str(self.gpu_info.get("summary", "")).strip()
@@ -526,6 +598,15 @@ class VideoSaturationPanel(ttk.Frame):
             return
         gpu_mode = self._selected_gpu_mode()
         gpu_device = self._selected_gpu_device()
+        if gpu_mode != "off" and not self._validate_hwaccel(ffmpeg_path, gpu_mode):
+            switch = messagebox.askyesno(
+                self.context.t("video_saturation.gpu.validation_failed.title"),
+                self.context.t("video_saturation.gpu.validation_failed.message", mode=gpu_mode),
+            )
+            if not switch:
+                return
+            gpu_mode = "off"
+            self.gpu_mode.set("off")
         self.run_generation += 1
         generation = self.run_generation
         self.cancel_event.clear()
@@ -562,6 +643,7 @@ class VideoSaturationPanel(ttk.Frame):
         total = len(files)
         completed = 0
         processed = 0
+        gpu_error_seen = False
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
             futures = {}
             for input_path in files:
@@ -593,6 +675,9 @@ class VideoSaturationPanel(ttk.Frame):
                         continue
                     stderr = (exc.stderr or "").strip()[-2000:]
                     error_info = {"input": str(input_path), "output": str(output_path), "stderr": stderr}
+                    if gpu_mode != "off" and not gpu_error_seen and self._is_gpu_error(stderr):
+                        gpu_error_seen = True
+                        error_info["gpu_hint"] = self.context.t("video_saturation.gpu.error_hint", mode=gpu_mode)
                     self.error_details[str(input_path)] = json.dumps(error_info)
                     self.context.log(
                         PLUGIN_ID,
@@ -636,6 +721,11 @@ class VideoSaturationPanel(ttk.Frame):
                     ),
                 )
 
+        if gpu_error_seen:
+            self.after(0, lambda: messagebox.showwarning(
+                self.context.t("video_saturation.gpu.error_detected.title"),
+                self.context.t("video_saturation.gpu.error_detected.message", mode=gpu_mode),
+            ))
         self.after(0, self._finish_run, completed, total, generation, self.cancel_event.is_set())
 
     def _process_video(
