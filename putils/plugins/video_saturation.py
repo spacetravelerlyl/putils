@@ -279,6 +279,11 @@ class VideoSaturationPanel(ttk.Frame):
         self.task_filter_combo.grid(row=0, column=3)
         self.task_filter_combo.bind("<<ComboboxSelected>>", self._on_task_filter_selected)
 
+        self.add_from_task_button = ttk.Button(
+            filter_frame, command=self._add_from_task
+        )
+        self.add_from_task_button.grid(row=0, column=4, padx=(6, 0))
+
         actions = ttk.Frame(self)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.add_button = ttk.Button(actions, command=self._add_files)
@@ -1545,6 +1550,7 @@ class VideoSaturationPanel(ttk.Frame):
         ])
         self.status_filter_var.set(self.context.t("video_saturation.filter.all"))
         self.task_filter_label.configure(text=self.context.t("video_saturation.task_filter"))
+        self.add_from_task_button.configure(text=self.context.t("video_saturation.add_from_task"))
         self._update_task_filter_combobox()
         self.file_tree.heading("path", text=self.context.t("video_saturation.video"))
         self.file_tree.heading("status", text=self.context.t("video_saturation.status"))
@@ -1679,6 +1685,53 @@ class VideoSaturationPanel(ttk.Frame):
                     utc_now_iso(),
                 ),
             )
+
+    def _add_from_task(self) -> None:
+        """Import videos visible in the current task-filtered view into the active file list."""
+        if self.running:
+            return
+        selected_task = self.task_filter_var.get()
+        all_label = self.context.t("video_saturation.task_filter.all")
+        if not selected_task or selected_task == all_label:
+            messagebox.showinfo(
+                self.context.t("video_saturation.add_from_task.no_task"),
+                self.context.t("video_saturation.add_from_task.no_task"),
+            )
+            return
+
+        existing = {path.resolve() for path in self.files}
+        added = 0
+        for item_id in self.file_tree.get_children():
+            try:
+                file_path = Path(item_id)
+            except Exception:
+                continue
+            if not file_path.exists():
+                continue
+            if file_path.resolve() in existing:
+                continue
+            self.files.append(file_path.resolve())
+            existing.add(file_path.resolve())
+            self.selected_items[item_id] = True
+            self.item_status_keys[item_id] = "video_saturation.pending"
+            self.output_paths.pop(item_id, None)
+            self.error_details.pop(item_id, None)
+            added += 1
+
+        if added > 0:
+            self._save_to_cache()
+            self.task_filter_var.set(all_label)
+            self._on_task_filter_selected()
+            self._set_status("video_saturation.selected", count=len(self.files))
+
+        messagebox.showinfo(
+            self.context.t("video_saturation.add_from_task"),
+            self.context.t(
+                "video_saturation.add_from_task.added",
+                count=added,
+                task_id=selected_task,
+            ),
+        )
 
     # ── Task ID & task management ──────────────────────────────────
 
