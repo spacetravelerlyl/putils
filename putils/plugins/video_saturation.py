@@ -814,6 +814,9 @@ class VideoSaturationPanel(ttk.Frame):
                             "input": str(input_path),
                             "output": str(output_path),
                             "stderr": stderr,
+                            "saturation": saturation,
+                            "gpu_mode": gpu_mode,
+                            "gpu_device": gpu_device,
                             **timing,
                         }
                         if gpu_mode != "off" and not gpu_error_seen and self._is_gpu_error(stderr):
@@ -917,7 +920,7 @@ class VideoSaturationPanel(ttk.Frame):
         if self.cancel_event.is_set():
             raise RuntimeError("cancelled")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [ffmpeg_path, "-y"]
+        cmd = [ffmpeg_path, "-y", "-hide_banner"]
         if gpu_mode != "off":
             cmd.extend(["-hwaccel", gpu_mode])
         if parallelism > 1:
@@ -938,7 +941,7 @@ class VideoSaturationPanel(ttk.Frame):
         start_time = _datetime.now(_timezone.utc)
         start_monotonic = time.monotonic()
         env = os.environ.copy()
-        if gpu_device and gpu_device != self.context.t("video_saturation.gpu.device.none"):
+        if gpu_mode != "off" and gpu_device and gpu_device != self.context.t("video_saturation.gpu.device.none"):
             env["CUDA_VISIBLE_DEVICES"] = gpu_device
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", env=env)
         with self.process_lock:
