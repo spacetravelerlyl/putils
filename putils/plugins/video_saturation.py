@@ -167,7 +167,7 @@ class VideoSaturationPanel(ttk.Frame):
         self._init_cache()
         self.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(4, weight=1)
+        self.rowconfigure(5, weight=1)
         self._build_ui()
         self._restore_from_cache()
 
@@ -278,6 +278,8 @@ class VideoSaturationPanel(ttk.Frame):
         )
         self.progress_canvas.bind("<Configure>", lambda _event: self._redraw_progress())
 
+        self._build_dependency_bar()
+
         columns = ("selected", "path", "status")
         self.file_tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
         self.file_tree.heading("selected", text="", command=self._toggle_select_all)
@@ -286,14 +288,39 @@ class VideoSaturationPanel(ttk.Frame):
         self.file_tree.column("selected", width=40, anchor="center", stretch=False)
         self.file_tree.column("path", width=650, anchor="w")
         self.file_tree.column("status", width=150, anchor="w")
-        self.file_tree.grid(row=4, column=0, sticky="nsew")
+        self.file_tree.grid(row=5, column=0, sticky="nsew")
         self.file_tree.bind("<Button-3>", self._show_file_context_menu)
         self.file_tree.bind("<ButtonRelease-1>", self._on_tree_click)
 
         scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.file_tree.yview)
-        scrollbar.grid(row=4, column=1, sticky="ns")
+        scrollbar.grid(row=5, column=1, sticky="ns")
         self.file_tree.configure(yscrollcommand=scrollbar.set)
         self.set_language()
+
+    def _build_dependency_bar(self) -> None:
+        self.dependency_bar = ttk.Frame(self)
+        self.dependency_bar.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        self.dependency_label = ttk.Label(self.dependency_bar)
+        self.dependency_label.grid(row=0, column=0, padx=(0, 8))
+        self.dependency_items_label = ttk.Label(self.dependency_bar, foreground="#6b7280")
+        self.dependency_items_label.grid(row=0, column=1, sticky="w")
+        self._refresh_dependency_display()
+
+    def _refresh_dependency_display(self) -> None:
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffplay_path = shutil.which("ffplay")
+        ffprobe_path = shutil.which("ffprobe")
+        items = [
+            (self.context.t("dependency.available") if ffmpeg_path else self.context.t("dependency.missing"), ffmpeg_path, "ffmpeg"),
+            (self.context.t("dependency.available") if ffplay_path else self.context.t("dependency.missing"), ffplay_path, "ffplay"),
+            (self.context.t("dependency.available") if ffprobe_path else self.context.t("dependency.missing"), ffprobe_path, "ffprobe"),
+        ]
+        self.dependency_label.configure(text=f"{self.context.t('dependency.title')}:")
+        parts = []
+        for status_text, available, name in items:
+            symbol = "✓" if available else "✗"
+            parts.append(f"{symbol} {name}")
+        self.dependency_items_label.configure(text="  ".join(parts))
 
     def _on_saturation_change(self, *_args) -> None:
         value = round(float(self.saturation.get()), 2)
@@ -1320,6 +1347,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.file_tree.heading("path", text=self.context.t("video_saturation.video"))
         self.file_tree.heading("status", text=self.context.t("video_saturation.status"))
         self.status.set(self.context.t(self.status_key, **self.status_kwargs))
+        self._refresh_dependency_display()
         self._refresh_selection_display()
         for item_id, status_key in self.item_status_keys.items():
             if self.file_tree.exists(item_id):

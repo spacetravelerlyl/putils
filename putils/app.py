@@ -117,46 +117,10 @@ class PUtilsApp(tk.Tk):
         main_frame = ttk.Frame(self, padding=8)
         main_frame.grid(row=0, column=0, sticky="nsew")
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(1, weight=1)
-
-        dependency_frame = ttk.Frame(main_frame)
-        dependency_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        dependency_frame.columnconfigure(0, weight=1)
-
-        dependency_header = ttk.Frame(dependency_frame)
-        dependency_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        dependency_header.columnconfigure(0, weight=1)
-        self.dependency_title_label = ttk.Label(dependency_header)
-        self.dependency_title_label.grid(row=0, column=0, sticky="w")
-        self.dependency_check_button = ttk.Button(dependency_header, command=self._refresh_dependencies)
-        self.dependency_check_button.grid(
-            row=0, column=1, sticky="e"
-        )
-
-        dependency_columns = ("plugin", "dependency", "type", "required", "status", "version", "path", "message")
-        self.dependency_tree = ttk.Treeview(
-            dependency_frame,
-            columns=dependency_columns,
-            show="headings",
-            height=4,
-        )
-        for column, width in (
-            ("plugin", 145),
-            ("dependency", 145),
-            ("type", 90),
-            ("required", 80),
-            ("status", 90),
-            ("version", 130),
-            ("path", 220),
-            ("message", 260),
-        ):
-            self.dependency_tree.heading(column, text=column)
-            self.dependency_tree.column(column, width=width, anchor="w")
-        self.dependency_tree.grid(row=1, column=0, sticky="ew")
-        self.dependency_tree.bind("<Button-3>", self._show_dependency_context_menu)
+        main_frame.rowconfigure(0, weight=1)
 
         self.plugin_notebook = ttk.Notebook(main_frame)
-        self.plugin_notebook.grid(row=1, column=0, sticky="nsew")
+        self.plugin_notebook.grid(row=0, column=0, sticky="nsew")
 
     def _add_logs_page(self) -> None:
         log_frame = ttk.Frame(self.plugin_notebook, padding=8)
@@ -223,7 +187,6 @@ class PUtilsApp(tk.Tk):
 
     def _load_plugins(self) -> None:
         self.plugins = discover_plugins()
-        self._refresh_dependencies()
         self._add_settings_page()
         self._add_logs_page()
         if not self.plugins:
@@ -334,6 +297,8 @@ class PUtilsApp(tk.Tk):
         self.settings_migrate_button.grid_remove()
         self.settings_restore_defaults_button = ttk.Button(frame, command=self._restore_default_settings)
         self.settings_restore_defaults_button.grid(row=11, column=1, sticky="w", pady=(8, 0))
+        self.settings_dependency_button = ttk.Button(frame, command=self._show_dependency_summary)
+        self.settings_dependency_button.grid(row=11, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
         self.plugin_notebook.add(frame, text=self.context.t("settings.tab"))
         self.settings_tab_index = self.plugin_notebook.index("end") - 1
@@ -341,21 +306,6 @@ class PUtilsApp(tk.Tk):
 
     def _apply_language(self) -> None:
         self.title(self.context.t("app.title"))
-
-        self.dependency_title_label.configure(text=self.context.t("dependency.title"))
-        self.dependency_check_button.configure(text=self.context.t("dependency.check"))
-        dependency_headings = {
-            "plugin": "dependency.plugin",
-            "dependency": "dependency.dependency",
-            "type": "dependency.type",
-            "required": "dependency.required",
-            "status": "dependency.status",
-            "version": "dependency.version",
-            "path": "dependency.path",
-            "message": "dependency.message",
-        }
-        for column, key in dependency_headings.items():
-            self.dependency_tree.heading(column, text=self.context.t(key))
 
         self.logs_title_label.configure(text=self.context.t("logs.title"))
         self.logs_refresh_button.configure(text=self.context.t("logs.refresh"))
@@ -403,7 +353,6 @@ class PUtilsApp(tk.Tk):
             language_setter = getattr(panel, "set_language", None)
             if language_setter is not None:
                 language_setter()
-        self._refresh_dependencies()
 
     def _apply_settings_language(self) -> None:
         if self.settings_frame is None:
@@ -428,6 +377,7 @@ class PUtilsApp(tk.Tk):
         self.settings_save_button.configure(text=self.context.t("settings.save"))
         self.settings_migrate_button.configure(text=self.context.t("settings.migrate"))
         self.settings_restore_defaults_button.configure(text=self.context.t("settings.restore_defaults"))
+        self.settings_dependency_button.configure(text=self.context.t("dependency.title"))
         hint = self.context.t("settings.restart_hint")
         if os.environ.get("PUTILS_DATA_DIR"):
             hint = f"{hint} {self.context.t('settings.env_override')}"
@@ -444,6 +394,7 @@ class PUtilsApp(tk.Tk):
             return
         self.translator.set_language(next_language)
         self.config_store.set(APP_CONFIG_NAMESPACE, "language", next_language)
+        self.context.log("app", "INFO", f"Language changed to {next_language}")
         self._apply_language()
 
     def _on_timezone_selected(self, _event=None) -> None:
@@ -453,6 +404,7 @@ class PUtilsApp(tk.Tk):
             self.timezone_var.set(selected)
         self.display_timezone = selected
         self.config_store.set(APP_CONFIG_NAMESPACE, "timezone", selected)
+        self.context.log("app", "INFO", f"Timezone changed to {selected}")
         self._refresh_logs(schedule=False)
 
     def _configured_log_retention_limit(self) -> int:
@@ -523,6 +475,14 @@ class PUtilsApp(tk.Tk):
             self.log_retention_var.set(str(log_retention_limit))
             self.log_store.set_retention_limit(log_retention_limit)
             self.log_store.rotate()
+            self.context.log(
+                "app", "INFO", "Settings saved",
+                {
+                    "data_dir": str(data_dir),
+                    "log_retention_limit": log_retention_limit,
+                    "log_level": log_level,
+                },
+            )
         except Exception as exc:
             messagebox.showerror(self.context.t("settings.error.title"), str(exc))
             return
@@ -559,6 +519,7 @@ class PUtilsApp(tk.Tk):
             self.context.min_log_level = DEFAULT_LOG_LEVEL
             self.log_store.set_retention_limit(DEFAULT_LOG_RETENTION_LIMIT)
             self.log_store.rotate()
+            self.context.log("app", "INFO", "Settings restored to defaults")
         except Exception as exc:
             messagebox.showerror(self.context.t("settings.error.title"), str(exc))
             return
@@ -631,20 +592,14 @@ class PUtilsApp(tk.Tk):
             }
             return fallback_offsets.get(self.display_timezone, timezone.utc)
 
-    def _refresh_dependencies(self) -> None:
-        for item in self.dependency_tree.get_children():
-            self.dependency_tree.delete(item)
-
+    def _collect_dependency_statuses(self) -> list[DependencyStatus]:
+        statuses: list[DependencyStatus] = []
         if not self.plugins:
-            self.dependency_tree.insert(
-                "", tk.END, values=("", "", "", "", self.context.t("dependency.no_plugins"), "", "", "")
-            )
-            return
-
+            return statuses
         for plugin in self.plugins:
             checker = getattr(plugin, "check_dependencies", None)
             if checker is None:
-                self._insert_dependency_status(
+                statuses.append(
                     DependencyStatus(
                         plugin_id=plugin.metadata.plugin_id,
                         name=self.context.t("dependency.no_check.name"),
@@ -656,9 +611,9 @@ class PUtilsApp(tk.Tk):
                 )
                 continue
             try:
-                statuses = checker(self.context)
+                plugin_statuses = checker(self.context)
             except Exception as exc:
-                statuses = [
+                plugin_statuses = [
                     DependencyStatus(
                         plugin_id=plugin.metadata.plugin_id,
                         name=self.context.t("dependency.no_check.name"),
@@ -668,8 +623,8 @@ class PUtilsApp(tk.Tk):
                         message=str(exc),
                     )
                 ]
-            if not statuses:
-                statuses = [
+            if not plugin_statuses:
+                plugin_statuses = [
                     DependencyStatus(
                         plugin_id=plugin.metadata.plugin_id,
                         name=self.context.t("dependency.no_external.name"),
@@ -678,24 +633,96 @@ class PUtilsApp(tk.Tk):
                         available=True,
                     )
                 ]
-            for status in statuses:
-                self._insert_dependency_status(status)
+            statuses.extend(plugin_statuses)
+        return statuses
 
-    def _insert_dependency_status(self, status: DependencyStatus) -> None:
-        self.dependency_tree.insert(
-            "",
-            tk.END,
-            values=(
-                status.plugin_id,
-                status.name,
-                status.dependency_type,
-                self.context.t("dependency.yes") if status.required else self.context.t("dependency.no"),
-                self.context.t("dependency.available") if status.available else self.context.t("dependency.missing"),
-                status.version,
-                status.path,
-                status.message,
-            ),
+    def _show_dependency_summary(self) -> None:
+        window = tk.Toplevel(self)
+        window.title(self.context.t("dependency.title"))
+        window.geometry("860x400")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(window, padding=8)
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text=self.context.t("dependency.title")).grid(row=0, column=0, sticky="w")
+        ttk.Button(header, text=self.context.t("dependency.check"), command=lambda: self._refresh_dependency_popup(tree)).grid(
+            row=0, column=1, sticky="e", padx=(8, 0)
         )
+
+        columns = ("plugin", "dependency", "type", "required", "status", "version", "path", "message")
+        tree = ttk.Treeview(window, columns=columns, show="headings", height=12)
+        heading_keys = {
+            "plugin": "dependency.plugin",
+            "dependency": "dependency.dependency",
+            "type": "dependency.type",
+            "required": "dependency.required",
+            "status": "dependency.status",
+            "version": "dependency.version",
+            "path": "dependency.path",
+            "message": "dependency.message",
+        }
+        for column, width in (
+            ("plugin", 120),
+            ("dependency", 90),
+            ("type", 100),
+            ("required", 60),
+            ("status", 80),
+            ("version", 180),
+            ("path", 180),
+            ("message", 200),
+        ):
+            tree.heading(column, text=self.context.t(heading_keys[column]))
+            tree.column(column, width=width, anchor="w")
+        tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        scrollbar = ttk.Scrollbar(window, orient=tk.VERTICAL, command=tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns", pady=(0, 8))
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        tree.bind("<Button-3>", lambda e: self._show_dependency_context_menu_popup(tree, e))
+
+        self._refresh_dependency_popup(tree)
+
+    def _refresh_dependency_popup(self, tree: ttk.Treeview) -> None:
+        for item in tree.get_children():
+            tree.delete(item)
+        statuses = self._collect_dependency_statuses()
+        if not statuses:
+            tree.insert("", tk.END, values=("", "", "", "", self.context.t("dependency.no_plugins"), "", "", ""))
+        else:
+            for status in statuses:
+                tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        status.plugin_id,
+                        status.name,
+                        status.dependency_type,
+                        self.context.t("dependency.yes") if status.required else self.context.t("dependency.no"),
+                        self.context.t("dependency.available") if status.available else self.context.t("dependency.missing"),
+                        status.version,
+                        status.path,
+                        status.message,
+                    ),
+                )
+
+    def _show_dependency_context_menu_popup(self, tree: ttk.Treeview, event) -> None:
+        item_id = tree.identify_row(event.y)
+        if item_id:
+            tree.selection_set(item_id)
+            tree.focus(item_id)
+        else:
+            tree.selection_remove(tree.selection())
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(
+            label=self.context.t("logs.context.copy"),
+            command=lambda: copy_treeview_selection_to_clipboard(tree, tree),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _refresh_logs(self, schedule: bool = True) -> None:
         for item in self.log_tree.get_children():
@@ -804,24 +831,6 @@ class PUtilsApp(tk.Tk):
 
         text.insert("1.0", json.dumps(details, indent=2, ensure_ascii=False))
         text.configure(state=tk.DISABLED)
-
-    def _show_dependency_context_menu(self, event) -> None:
-        item_id = self.dependency_tree.identify_row(event.y)
-        if item_id:
-            self.dependency_tree.selection_set(item_id)
-            self.dependency_tree.focus(item_id)
-        else:
-            self.dependency_tree.selection_remove(self.dependency_tree.selection())
-        menu = tk.Menu(self.dependency_tree, tearoff=0)
-        menu.add_command(
-            label=self.context.t("logs.context.copy"),
-            command=lambda: copy_treeview_selection_to_clipboard(self.dependency_tree, self.dependency_tree),
-        )
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-
 
 def main() -> None:
     app = PUtilsApp()
