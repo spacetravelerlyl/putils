@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS plugin_video_saturation_tasks (
 )
 """
 DEFAULT_PARALLELISM = max(1, min(4, os.cpu_count() or 1))
+DEFAULT_TASK_RETENTION = 1000
 VIDEO_FILE_TYPES = (
     ("video_saturation.file_types.video", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
     ("video_saturation.file_types.all", "*.*"),
@@ -181,6 +182,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.current_task_id: str = ""
         self.current_task_files: list[Path] = []
         self.task_filter_var = tk.StringVar(value="")
+        self.task_retention_limit = self._configured_task_retention()
 
         self._init_cache()
         self.grid(row=0, column=0, sticky="nsew")
@@ -244,6 +246,19 @@ class VideoSaturationPanel(ttk.Frame):
         self.gpu_device_label.grid(row=5, column=0, sticky="w", pady=(8, 0))
         self.gpu_device_combo = ttk.Combobox(controls, textvariable=self.gpu_device, state="readonly", width=40)
         self.gpu_device_combo.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        self.task_retention_label = ttk.Label(controls)
+        self.task_retention_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        self.task_retention_var = tk.IntVar(value=self.task_retention_limit)
+        self.task_retention_spinbox = ttk.Spinbox(
+            controls,
+            textvariable=self.task_retention_var,
+            from_=1,
+            to=999999,
+            width=8,
+            command=self._on_task_retention_change,
+        )
+        self.task_retention_spinbox.grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
         filter_frame = ttk.Frame(self)
         filter_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
@@ -353,12 +368,27 @@ class VideoSaturationPanel(ttk.Frame):
         self.ratio_label.configure(text=f"{value:.2f}")
         self.context.set_config(CONFIG_NAMESPACE, "saturation", value)
 
+    def _on_task_retention_change(self) -> None:
+        value = self.task_retention_var.get()
+        if value < 1:
+            return
+        self.task_retention_limit = value
+        self.context.set_config(CONFIG_NAMESPACE, "task_retention", value)
+
     def _configured_parallelism(self) -> int:
         value = self.context.get_config(CONFIG_NAMESPACE, "parallelism", DEFAULT_PARALLELISM)
         try:
             parsed = int(value)
         except (TypeError, ValueError):
             return DEFAULT_PARALLELISM
+        return max(1, parsed)
+
+    def _configured_task_retention(self) -> int:
+        value = self.context.get_config(CONFIG_NAMESPACE, "task_retention", DEFAULT_TASK_RETENTION)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_TASK_RETENTION
         return max(1, parsed)
 
     def _selected_parallelism(self) -> int:
@@ -626,13 +656,13 @@ class VideoSaturationPanel(ttk.Frame):
         self.detached_items.clear()
         self.current_task_id = ""
         self.current_task_files.clear()
-        self.context.cache_store.clear(PLUGIN_ID)
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
         self.progress.set(0)
         self.progress_text.set("0%")
         self._redraw_progress("#9ca3af")
         self._set_status("video_saturation.ready")
+        self.task_filter_var.set(self.context.t("video_saturation.task_filter.all"))
         self._update_task_filter_combobox()
 
     def _run(self) -> None:
@@ -697,6 +727,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.current_task_id = task_id
         self.current_task_files = list(files)
         self._create_task(task_id, len(files))
+        self._prune_old_tasks()
         self._update_task_filter_combobox()
         self.worker_thread = threading.Thread(
             target=self._run_worker,
@@ -1408,6 +1439,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.gpu_mode_combo.configure(values=self.gpu_modes, state="readonly")
         self.gpu_mode.set(self._selected_gpu_mode())
         self.gpu_device_combo.configure(values=self.gpu_device_labels, state="readonly" if self.gpu_devices else tk.DISABLED)
+        self.task_retention_label.configure(text=self.context.t("video_saturation.task_retention"))
         self.browse_button.configure(text=self.context.t("video_saturation.browse"))
         self.add_button.configure(text=self.context.t("video_saturation.add_videos"))
         self.add_directory_button.configure(text=self.context.t("video_saturation.add_directory"))
@@ -1453,7 +1485,10 @@ class VideoSaturationPanel(ttk.Frame):
         )
 
     def _restore_from_cache(self) -> None:
-        rows = self.context.cache_store.get_all(PLUGIN_ID)
+        rows = self.context.cache_store.query(
+            f"SELECT * FROM plugin_{PLUGIN_ID} WHERE task_id IS NULL OR task_id = '' "
+            f"OR task_id IN (SELECT task_id FROM {TASKS_TABLE} WHERE status = 'running')"
+        )
         for row in rows:
             file_path = Path(row["file_path"])
             if not file_path.exists():
@@ -1550,23 +1585,25 @@ class VideoSaturationPanel(ttk.Frame):
         selected = self.task_filter_var.get()
         for item_id in self.file_tree.get_children():
             self.file_tree.delete(item_id)
+        self.detached_items.clear()
         if not selected or selected == self.context.t("video_saturation.task_filter.all"):
-            self._restore_from_cache()
+            rows = self.context.cache_store.get_all(PLUGIN_ID)
         else:
             rows = self._load_videos_by_task(selected)
-            for row in rows:
-                file_path = Path(row["file_path"])
-                if not file_path.exists():
-                    continue
-                iid = str(file_path)
-                selected_text = "☑" if self.selected_items.get(iid, True) else "☐"
-                status_key = row["status"] if row["status"] else "video_saturation.pending"
-                self.file_tree.insert(
-                    "",
-                    tk.END,
-                    iid=iid,
-                    values=(selected_text, str(file_path), self.context.t(status_key)),
-                )
+        for row in rows:
+            file_path = Path(row["file_path"])
+            if not file_path.exists():
+                continue
+            iid = str(file_path)
+            selected_text = "☑" if self.selected_items.get(iid, True) else "☐"
+            status_key = row["status"] if row["status"] else "video_saturation.pending"
+            self.item_status_keys[iid] = status_key
+            self.file_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(selected_text, str(file_path), self.context.t(status_key)),
+            )
         self._apply_status_filter()
 
     def _tag_video_task_id(self, input_path: Path, task_id: str) -> None:
@@ -1574,6 +1611,23 @@ class VideoSaturationPanel(ttk.Frame):
             f"UPDATE plugin_{PLUGIN_ID} SET task_id = ? WHERE file_path = ?",
             (task_id, str(input_path)),
         )
+
+    def _prune_old_tasks(self) -> None:
+        tasks = self.context.cache_store.query(
+            f"SELECT task_id FROM {TASKS_TABLE} ORDER BY created_at DESC"
+        )
+        if len(tasks) <= self.task_retention_limit:
+            return
+        stale_ids = [row["task_id"] for row in tasks[self.task_retention_limit:]]
+        for task_id in stale_ids:
+            self.context.cache_store.execute(
+                f"DELETE FROM plugin_{PLUGIN_ID} WHERE task_id = ?",
+                (task_id,),
+            )
+            self.context.cache_store.execute(
+                f"DELETE FROM {TASKS_TABLE} WHERE task_id = ?",
+                (task_id,),
+            )
 
     def _process_selected(self) -> None:
         self._run()
