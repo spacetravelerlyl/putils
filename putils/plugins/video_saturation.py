@@ -89,7 +89,8 @@ class VideoSaturationPlugin:
                 [ffmpeg_path, "-version"],
                 check=True,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             ffmpeg_version = result.stdout.splitlines()[0] if result.stdout else ""
@@ -420,7 +421,8 @@ class VideoSaturationPanel(ttk.Frame):
                     [ffmpeg_path, "-hide_banner", "-hwaccels"],
                     check=True,
                     capture_output=True,
-                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=5,
                 )
                 raw_hwaccels = [
@@ -938,7 +940,7 @@ class VideoSaturationPanel(ttk.Frame):
         env = os.environ.copy()
         if gpu_device and gpu_device != self.context.t("video_saturation.gpu.device.none"):
             env["CUDA_VISIBLE_DEVICES"] = gpu_device
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", env=env)
         with self.process_lock:
             self.active_processes.add(process)
         try:
@@ -1223,7 +1225,8 @@ class VideoSaturationPanel(ttk.Frame):
             ],
             check=True,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
         values: dict[str, str] = {}
@@ -1247,7 +1250,8 @@ class VideoSaturationPanel(ttk.Frame):
             ],
             check=True,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
         values: list[str] = []
