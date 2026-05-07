@@ -23,16 +23,17 @@ TASKS_TABLE = "plugin_video_saturation_tasks"
 CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {table_name} (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_path TEXT NOT NULL UNIQUE,
+    file_path TEXT NOT NULL,
     selected INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'pending',
     output_path TEXT,
     source_directory TEXT,
     error_message TEXT,
     error_details TEXT,
-    task_id TEXT,
+    task_id TEXT DEFAULT '',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(file_path, task_id)
 )
 """
 TASKS_SCHEMA = """
@@ -42,8 +43,7 @@ CREATE TABLE IF NOT EXISTS plugin_video_saturation_tasks (
     video_count INTEGER NOT NULL DEFAULT 0,
     completed_count INTEGER NOT NULL DEFAULT 0,
     failed_count INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'running',
-    batch INTEGER NOT NULL DEFAULT 1
+    status TEXT NOT NULL DEFAULT 'running'
 )
 """
 DEFAULT_PARALLELISM = max(1, min(4, os.cpu_count() or 1))
@@ -883,7 +883,7 @@ class VideoSaturationPanel(ttk.Frame):
         input_path = pending.popleft()
         self._set_item_status(input_path, "video_saturation.running", generation)
         self._tag_video_task_id(input_path, task_id)
-        output_path = self._output_path_for(input_path, output_dir)
+        output_path = self._output_path_for(input_path, output_dir, task_id)
         futures[
             executor.submit(
                 self._process_video,
@@ -1011,7 +1011,7 @@ class VideoSaturationPanel(ttk.Frame):
             self.pause_event.set()
             self.pause_button.configure(text=self.context.t("video_saturation.resume"))
 
-    def _output_path_for(self, input_path: Path, output_dir: str) -> Path:
+    def _output_path_for(self, input_path: Path, output_dir: str, task_id: str) -> Path:
         source_directory = self.source_directories.get(str(input_path))
         if source_directory is not None:
             target_root = (
@@ -1019,12 +1019,12 @@ class VideoSaturationPanel(ttk.Frame):
                 if output_dir
                 else source_directory.parent
             )
-            directory = target_root / f"{source_directory.name}_saturation_adjusted"
+            directory = target_root / f"{source_directory.name}_{task_id}"
             relative_parent = input_path.parent.relative_to(source_directory)
             directory = directory / relative_parent
         else:
             directory = Path(output_dir).expanduser().resolve() if output_dir else input_path.parent
-        return directory / f"{input_path.stem}_saturation_adjusted{input_path.suffix}"
+        return directory / f"{input_path.stem}_{task_id}{input_path.suffix}"
 
     def _set_item_status(self, input_path: Path, status_key: str, generation: int | None = None) -> None:
         def update() -> None:
@@ -1447,6 +1447,9 @@ class VideoSaturationPanel(ttk.Frame):
                 },
             )
         self._save_to_cache()
+        self.current_task_id = ""
+        self.current_task_files.clear()
+        self.video_timing.clear()
 
     def _collect_file_statuses(self) -> list[dict]:
         result: list[dict] = []
@@ -1557,26 +1560,70 @@ class VideoSaturationPanel(ttk.Frame):
         self.context.cache_store.ensure_plugin_table(PLUGIN_ID, CACHE_SCHEMA)
         try:
             self.context.cache_store.execute(
-                f"ALTER TABLE plugin_{PLUGIN_ID} ADD COLUMN task_id TEXT"
+                f"ALTER TABLE plugin_{PLUGIN_ID} ADD COLUMN task_id TEXT DEFAULT ''"
             )
         except sqlite3.OperationalError:
             pass
+        self._migrate_cache_unique_constraint()
         self.context.cache_store.execute(TASKS_SCHEMA)
         self.context.cache_store.execute(
             f"CREATE INDEX IF NOT EXISTS idx_plugin_{PLUGIN_ID}_task_id "
             f"ON plugin_{PLUGIN_ID}(task_id)"
         )
 
+    def _migrate_cache_unique_constraint(self) -> None:
+        table_name = f"plugin_{PLUGIN_ID}"
+        rows = self.context.cache_store.query(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        )
+        create_sql = (rows[0]["sql"] if rows else "") or ""
+        if "file_path TEXT NOT NULL UNIQUE" not in create_sql:
+            return
+        self.context.cache_store.execute(
+            f"UPDATE {table_name} SET task_id = '' WHERE task_id IS NULL"
+        )
+        self.context.cache_store.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.context.cache_store.execute(
+                f"CREATE TABLE {table_name}_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "file_path TEXT NOT NULL, "
+                "selected INTEGER NOT NULL DEFAULT 1, "
+                "status TEXT NOT NULL DEFAULT 'pending', "
+                "output_path TEXT, "
+                "source_directory TEXT, "
+                "error_message TEXT, "
+                "error_details TEXT, "
+                "task_id TEXT DEFAULT '', "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "UNIQUE(file_path, task_id)"
+                ")"
+            )
+            self.context.cache_store.execute(
+                f"INSERT INTO {table_name}_new SELECT * FROM {table_name}"
+            )
+            self.context.cache_store.execute(f"DROP TABLE {table_name}")
+            self.context.cache_store.execute(
+                f"ALTER TABLE {table_name}_new RENAME TO {table_name}"
+            )
+        finally:
+            self.context.cache_store.execute("PRAGMA foreign_keys = ON")
+
     def _restore_from_cache(self) -> None:
         rows = self.context.cache_store.query(
             f"SELECT * FROM plugin_{PLUGIN_ID} WHERE task_id IS NULL OR task_id = '' "
-            f"OR task_id IN (SELECT task_id FROM {TASKS_TABLE} WHERE status = 'running')"
+            f"OR task_id IN (SELECT task_id FROM {TASKS_TABLE} WHERE status = 'running') "
+            f"ORDER BY task_id DESC"
         )
         for row in rows:
             file_path = Path(row["file_path"])
+            iid = str(file_path)
+            if iid in self.item_status_keys:
+                continue
             if not file_path.exists():
                 continue
-            iid = str(file_path)
             self.files.append(file_path)
             self.selected_items[iid] = bool(row["selected"])
             self.item_status_keys[iid] = row["status"]
@@ -1600,21 +1647,37 @@ class VideoSaturationPanel(ttk.Frame):
 
     def _save_to_cache(self) -> None:
         task_file_set = {str(p) for p in self.current_task_files}
+        table_name = f"plugin_{PLUGIN_ID}"
         for file_path in self.files:
             iid = str(file_path)
             if self.current_task_id and iid not in task_file_set:
                 continue
-            self.context.cache_store.upsert(
-                PLUGIN_ID,
-                str(file_path),
-                selected=1 if self.selected_items.get(iid, True) else 0,
-                status=self.item_status_keys.get(iid, "video_saturation.pending"),
-                output_path=str(self.output_paths.get(iid, "")),
-                source_directory=str(self.source_directories.get(iid, "")),
-                error_message="",
-                error_details=self.error_details.get(iid, ""),
-                task_id=self.current_task_id if iid in task_file_set else "",
-                created_at=utc_now_iso(),
+            task_id = self.current_task_id if iid in task_file_set else ""
+            self.context.cache_store.execute(
+                f"INSERT INTO {table_name} "
+                "(file_path, selected, status, output_path, source_directory, "
+                "error_message, error_details, task_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(file_path, task_id) DO UPDATE SET "
+                "selected = excluded.selected, "
+                "status = excluded.status, "
+                "output_path = excluded.output_path, "
+                "source_directory = excluded.source_directory, "
+                "error_message = excluded.error_message, "
+                "error_details = excluded.error_details, "
+                "updated_at = excluded.updated_at",
+                (
+                    str(file_path),
+                    1 if self.selected_items.get(iid, True) else 0,
+                    self.item_status_keys.get(iid, "video_saturation.pending"),
+                    str(self.output_paths.get(iid, "")),
+                    str(self.source_directories.get(iid, "")),
+                    "",
+                    self.error_details.get(iid, ""),
+                    task_id,
+                    utc_now_iso(),
+                    utc_now_iso(),
+                ),
             )
 
     # ── Task ID & task management ──────────────────────────────────
@@ -1623,13 +1686,7 @@ class VideoSaturationPanel(ttk.Frame):
         from datetime import datetime
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
-        rows = self.context.cache_store.query(
-            f"SELECT MAX(batch) FROM {TASKS_TABLE} WHERE task_id LIKE ?",
-            (f"{timestamp}%",),
-        )
-        max_batch = rows[0][0] if rows and rows[0][0] is not None else 0
-        batch = max_batch + 1
-        return f"{timestamp}_{video_count}_{batch}"
+        return f"{timestamp}_{video_count}"
 
     def _create_task(self, task_id: str, video_count: int) -> None:
         self.context.cache_store.execute(
@@ -1672,7 +1729,10 @@ class VideoSaturationPanel(ttk.Frame):
             self.file_tree.delete(item_id)
         self.detached_items.clear()
         if not selected or selected == self.context.t("video_saturation.task_filter.all"):
-            rows = self.context.cache_store.get_all(PLUGIN_ID)
+            rows = self.context.cache_store.query(
+                f"SELECT * FROM plugin_{PLUGIN_ID} "
+                f"WHERE id IN (SELECT MAX(id) FROM plugin_{PLUGIN_ID} GROUP BY file_path)"
+            )
         else:
             rows = self._load_videos_by_task(selected)
         for row in rows:
@@ -1680,6 +1740,8 @@ class VideoSaturationPanel(ttk.Frame):
             if not file_path.exists():
                 continue
             iid = str(file_path)
+            if self.file_tree.exists(iid):
+                continue
             selected_text = "☑" if self.selected_items.get(iid, True) else "☐"
             status_key = row["status"] if row["status"] else "video_saturation.pending"
             self.item_status_keys[iid] = status_key
@@ -1693,7 +1755,11 @@ class VideoSaturationPanel(ttk.Frame):
 
     def _tag_video_task_id(self, input_path: Path, task_id: str) -> None:
         self.context.cache_store.execute(
-            f"UPDATE plugin_{PLUGIN_ID} SET task_id = ? WHERE file_path = ?",
+            f"DELETE FROM plugin_{PLUGIN_ID} WHERE file_path = ? AND task_id = ?",
+            (str(input_path), task_id),
+        )
+        self.context.cache_store.execute(
+            f"UPDATE plugin_{PLUGIN_ID} SET task_id = ? WHERE file_path = ? AND task_id = ''",
             (task_id, str(input_path)),
         )
 
