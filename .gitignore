@@ -1,10 +1,35 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
-venv/
+# PyInstaller build artifacts
 build/
 dist/
-*.spec
+*.spec.backup
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Application data (don't commit user data)
+data_dir.json
 *.sqlite3
 
+# Linux specific
+*.AppImage
+AppDir/
