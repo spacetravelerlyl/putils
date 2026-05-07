@@ -54,7 +54,8 @@ echo Done.
 echo.
 
 echo [Step 3/4] Building with PyInstaller...
-pyinstaller --clean putils.spec
+echo Using spec file: %~dp0putils.spec
+pyinstaller --clean "%~dp0putils.spec"
 if errorlevel 1 (
     echo ERROR: Build failed
     pause

@@ -1,45 +1,148 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
 
-datas = [('putils/i18n.py', 'putils'), ('putils/plugins', 'putils/plugins')]
-binaries = []
-hiddenimports = ['putils.plugins', 'putils.plugins.video_saturation', 'zoneinfo', 'tkinter', 'sqlite3']
-tmp_ret = collect_all('tkinter')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+block_cipher = None
 
+# Collect all plugin modules dynamically
+import os
+import sys
+import glob
+
+# Use appropriate path separator for the platform
+path_sep = os.sep
+
+plugin_pattern = os.path.join('putils', 'plugins', '*.py')
+plugin_files = glob.glob(plugin_pattern)
+plugin_modules = []
+for pf in plugin_files:
+    module_name = os.path.splitext(os.path.basename(pf))[0]
+    if module_name != '__init__':
+        plugin_modules.append(f'putils.plugins.{module_name}')
+
+print(f"Discovered plugins: {plugin_modules}")
 
 a = Analysis(
-    ['putils\\app.py'],
+    ['putils' + path_sep + 'app.py'],
     pathex=[],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    binaries=[],
+    datas=[
+        # Include all Python source files from putils package
+        ('putils' + path_sep + '*.py', 'putils'),
+        # Include plugins directory with all plugin files
+        ('putils' + path_sep + 'plugins' + path_sep + '*.py', 'putils' + path_sep + 'plugins'),
+    ],
+    hiddenimports=[
+        # Core putils modules - MUST be first
+        'putils',
+        'putils.app',
+        'putils.database',
+        'putils.i18n',
+        'putils.paths',
+        'putils.plugin_api',
+        'putils.plugin_loader',
+        'putils.tk_utils',
+        # Plugin modules (dynamically discovered)
+    ] + plugin_modules + [
+        # Critical standard library modules - ensure these are loaded early
+        'encodings',
+        'encodings.utf_8',
+        'encodings.latin_1',
+        'codecs',
+        '_collections_abc',
+        'os',
+        'sys',
+        'io',
+        'abc',
+        # Other standard library modules
+        'zoneinfo',
+        'json',
+        'subprocess',
+        'threading',
+        'concurrent.futures',
+        'pathlib',
+        'importlib',
+        'pkgutil',
+        'shutil',
+        'datetime',
+        'collections',
+        'functools',
+        'time',
+        'typing',
+        'dataclasses',
+        'tkinter',
+        'tkinter.filedialog',
+        'tkinter.messagebox',
+        'tkinter.ttk',
+        'sqlite3',
+        'hashlib',
+        'textwrap',
+        'contextlib',
+        'enum',
+        'copy',
+        'weakref',
+        'types',
+        'operator',
+        're',
+        'string',
+        'errno',
+        'stat',
+        'genericpath',
+        'ntpath',
+        'posixpath',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Exclude test and development modules
+        'test',
+        'unittest',
+        'doctest',
+        'pdb',
+        'pydoc',
+        'distutils',
+        'setuptools',
+        'pip',
+        # Exclude unnecessary modules to reduce size
+        'email',
+        'html',
+        'http',
+        'xml',
+        'urllib',
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
     noarchive=False,
-    optimize=0,
 )
-pyz = PYZ(a.pure)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='putils',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,
+    console=False,  # Set to True for debugging
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # icon='putils.ico',  # Uncomment and add icon file if available
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='putils',
 )

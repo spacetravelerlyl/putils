@@ -92,7 +92,9 @@ function Build-DirectoryPackage {
     Clean-Builds
     
     Write-Host "Running PyInstaller..." -ForegroundColor Yellow
-    pyinstaller --clean putils.spec
+    $specPath = Join-Path $PSScriptRoot "putils.spec"
+    Write-Host "Using spec file: $specPath"
+    pyinstaller --clean $specPath
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed"
     }
