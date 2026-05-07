@@ -14,10 +14,12 @@ from tkinter import filedialog, messagebox, ttk
 
 from putils.plugin_api import DependencyStatus, PluginMetadata
 from putils.tk_utils import copy_treeview_selection_to_clipboard, open_in_file_manager
+from putils.database import utc_now_iso
 
 
 PLUGIN_ID = "video_saturation"
 CONFIG_NAMESPACE = "plugin.video_saturation"
+TASKS_TABLE = "plugin_video_saturation_tasks"
 CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {table_name} (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,8 +30,20 @@ CREATE TABLE IF NOT EXISTS {table_name} (
     source_directory TEXT,
     error_message TEXT,
     error_details TEXT,
+    task_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+)
+"""
+TASKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS plugin_video_saturation_tasks (
+    task_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    video_count INTEGER NOT NULL DEFAULT 0,
+    completed_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running',
+    batch INTEGER NOT NULL DEFAULT 1
 )
 """
 DEFAULT_PARALLELISM = max(1, min(4, os.cpu_count() or 1))
@@ -163,6 +177,8 @@ class VideoSaturationPanel(ttk.Frame):
             default_device = saved_gpu_device
         self.gpu_device = tk.StringVar(value=default_device)
         self.gpu_status_text = tk.StringVar()
+        self.current_task_id: str = ""
+        self.task_filter_var = tk.StringVar(value="")
 
         self._init_cache()
         self.grid(row=0, column=0, sticky="nsew")
@@ -236,6 +252,14 @@ class VideoSaturationPanel(ttk.Frame):
         )
         self.status_filter_combo.grid(row=0, column=1)
         self.status_filter_combo.bind("<<ComboboxSelected>>", self._apply_status_filter)
+
+        self.task_filter_label = ttk.Label(filter_frame)
+        self.task_filter_label.grid(row=0, column=2, padx=(16, 4))
+        self.task_filter_combo = ttk.Combobox(
+            filter_frame, textvariable=self.task_filter_var, state="readonly", width=28
+        )
+        self.task_filter_combo.grid(row=0, column=3)
+        self.task_filter_combo.bind("<<ComboboxSelected>>", self._on_task_filter_selected)
 
         actions = ttk.Frame(self)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -597,6 +621,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.source_directories.clear()
         self.error_details.clear()
         self.detached_items.clear()
+        self.current_task_id = ""
         self.context.cache_store.clear(PLUGIN_ID)
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
@@ -604,6 +629,7 @@ class VideoSaturationPanel(ttk.Frame):
         self.progress_text.set("0%")
         self._redraw_progress("#9ca3af")
         self._set_status("video_saturation.ready")
+        self._update_task_filter_combobox()
 
     def _run(self) -> None:
         if self.running:
@@ -663,9 +689,13 @@ class VideoSaturationPanel(ttk.Frame):
         self._redraw_progress("#2563eb")
         self._set_status("video_saturation.running")
         saturation = round(float(self.saturation.get()), 2)
+        task_id = self._generate_task_id(len(files))
+        self.current_task_id = task_id
+        self._create_task(task_id, len(files))
+        self._update_task_filter_combobox()
         self.worker_thread = threading.Thread(
             target=self._run_worker,
-            args=(ffmpeg_path, saturation, output_dir, files, generation, parallelism, gpu_mode, gpu_device),
+            args=(ffmpeg_path, saturation, output_dir, files, generation, parallelism, gpu_mode, gpu_device, task_id),
             daemon=True,
         )
         self.worker_thread.start()
@@ -680,6 +710,7 @@ class VideoSaturationPanel(ttk.Frame):
         parallelism: int,
         gpu_mode: str,
         gpu_device: str,
+        task_id: str,
     ) -> None:
         total = len(files)
         completed = 0
@@ -689,6 +720,7 @@ class VideoSaturationPanel(ttk.Frame):
             futures = {}
             for input_path in files:
                 self._set_item_status(input_path, "video_saturation.running", generation)
+                self._tag_video_task_id(input_path, task_id)
                 output_path = self._output_path_for(input_path, output_dir)
                 futures[
                     executor.submit(
@@ -837,19 +869,6 @@ class VideoSaturationPanel(ttk.Frame):
             exc = subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
             exc._timing = timing
             raise exc
-        self.context.log(
-            PLUGIN_ID,
-            "INFO",
-            "Saturation adjustment completed",
-            {
-                "input": str(input_path),
-                "output": str(output_path),
-                "saturation": saturation,
-                "gpu_mode": gpu_mode,
-                "gpu_device": gpu_device,
-                **timing,
-            },
-        )
 
     def _selected_gpu_mode(self) -> str:
         mode = self.gpu_mode.get().strip()
@@ -1274,9 +1293,41 @@ class VideoSaturationPanel(ttk.Frame):
         self._update_progress(total if not cancelled else completed, total, "#16a34a" if completed == total and not cancelled else "#dc2626", generation)
         if cancelled:
             self._set_status("video_saturation.cancelled", generation, completed=completed, total=total)
+            task_status = "cancelled"
         else:
             self._set_status("video_saturation.finished", generation, completed=completed, total=total)
+            task_status = "completed"
+        failed = total - completed
+        task_id = self.current_task_id
+        if task_id:
+            self._update_task_status(task_id, completed, failed, task_status)
+            self.context.log(
+                PLUGIN_ID,
+                "INFO",
+                self.context.t("video_saturation.task_batch_log"),
+                {
+                    "task_id": task_id,
+                    "completed": completed,
+                    "failed": failed,
+                    "total": total,
+                    "cancelled": cancelled,
+                    "files": self._collect_file_statuses(),
+                },
+            )
         self._save_to_cache()
+
+    def _collect_file_statuses(self) -> list[dict]:
+        result: list[dict] = []
+        for f in self.files:
+            iid = str(f)
+            entry: dict = {"path": str(f), "status": self.item_status_keys.get(iid, "unknown")}
+            if iid in self.error_details:
+                try:
+                    entry["error"] = json.loads(self.error_details[iid])
+                except Exception:
+                    entry["error"] = self.error_details[iid]
+            result.append(entry)
+        return result
 
     def _update_progress(
         self,
@@ -1344,6 +1395,8 @@ class VideoSaturationPanel(ttk.Frame):
             self.context.t("video_saturation.failed"),
         ])
         self.status_filter_var.set(self.context.t("video_saturation.filter.all"))
+        self.task_filter_label.configure(text=self.context.t("video_saturation.task_filter"))
+        self._update_task_filter_combobox()
         self.file_tree.heading("path", text=self.context.t("video_saturation.video"))
         self.file_tree.heading("status", text=self.context.t("video_saturation.status"))
         self.status.set(self.context.t(self.status_key, **self.status_kwargs))
@@ -1354,7 +1407,20 @@ class VideoSaturationPanel(ttk.Frame):
                 self.file_tree.set(item_id, "status", self.context.t(status_key))
 
     def _init_cache(self) -> None:
+        import sqlite3
         self.context.cache_store.ensure_plugin_table(PLUGIN_ID, CACHE_SCHEMA)
+        try:
+            self.context.cache_store.execute(
+                f"ALTER TABLE plugin_{PLUGIN_ID} ADD COLUMN task_id TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
+        self.context.cache_store.execute(TASKS_SCHEMA)
+        self.context.cache_store.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_plugin_{PLUGIN_ID}_task_id "
+            f"ON plugin_{PLUGIN_ID}(task_id)"
+        )
+        self._update_task_filter_combobox()
 
     def _restore_from_cache(self) -> None:
         rows = self.context.cache_store.get_all(PLUGIN_ID)
@@ -1382,9 +1448,9 @@ class VideoSaturationPanel(ttk.Frame):
             )
         if self.files:
             self._set_status("video_saturation.selected", count=len(self.files))
+        self._update_task_filter_combobox()
 
     def _save_to_cache(self) -> None:
-        from datetime import datetime, timezone
         for file_path in self.files:
             iid = str(file_path)
             self.context.cache_store.upsert(
@@ -1396,8 +1462,87 @@ class VideoSaturationPanel(ttk.Frame):
                 source_directory=str(self.source_directories.get(iid, "")),
                 error_message="",
                 error_details=self.error_details.get(iid, ""),
-                created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                task_id=self.current_task_id,
+                created_at=utc_now_iso(),
             )
+
+    # ── Task ID & task management ──────────────────────────────────
+
+    def _generate_task_id(self, video_count: int) -> str:
+        from datetime import datetime
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        rows = self.context.cache_store.query(
+            f"SELECT MAX(batch) FROM {TASKS_TABLE} WHERE task_id LIKE ?",
+            (f"{timestamp}%",),
+        )
+        max_batch = rows[0][0] if rows and rows[0][0] is not None else 0
+        batch = max_batch + 1
+        return f"{timestamp}_{video_count}_{batch}"
+
+    def _create_task(self, task_id: str, video_count: int) -> None:
+        self.context.cache_store.execute(
+            f"INSERT INTO {TASKS_TABLE}(task_id, created_at, video_count, status) VALUES (?, ?, ?, 'running')",
+            (task_id, utc_now_iso(), video_count),
+        )
+
+    def _update_task_status(self, task_id: str, completed: int, failed: int, status: str) -> None:
+        self.context.cache_store.execute(
+            f"UPDATE {TASKS_TABLE} SET completed_count=?, failed_count=?, status=? WHERE task_id=?",
+            (completed, failed, status, task_id),
+        )
+
+    def _load_task_ids(self) -> list[str]:
+        rows = self.context.cache_store.query(
+            f"SELECT task_id FROM {TASKS_TABLE} ORDER BY created_at DESC"
+        )
+        return [row["task_id"] for row in rows]
+
+    def _load_videos_by_task(self, task_id: str) -> list:
+        return self.context.cache_store.query(
+            f"SELECT * FROM plugin_{PLUGIN_ID} WHERE task_id = ?",
+            (task_id,),
+        )
+
+    def _update_task_filter_combobox(self) -> None:
+        task_ids = self._load_task_ids()
+        all_label = self.context.t("video_saturation.task_filter.all")
+        values = [all_label] + task_ids
+        self.task_filter_combo.configure(values=values)
+        current = self.task_filter_var.get()
+        if not task_ids:
+            self.task_filter_var.set("")
+        elif not current or current not in values:
+            self.task_filter_var.set(all_label)
+
+    def _on_task_filter_selected(self, event=None) -> None:
+        selected = self.task_filter_var.get()
+        for item_id in self.file_tree.get_children():
+            self.file_tree.delete(item_id)
+        if not selected or selected == self.context.t("video_saturation.task_filter.all"):
+            self._restore_from_cache()
+        else:
+            rows = self._load_videos_by_task(selected)
+            for row in rows:
+                file_path = Path(row["file_path"])
+                if not file_path.exists():
+                    continue
+                iid = str(file_path)
+                selected_text = "☑" if self.selected_items.get(iid, True) else "☐"
+                status_key = row.get("status", "video_saturation.pending")
+                self.file_tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(selected_text, str(file_path), self.context.t(status_key)),
+                )
+        self._apply_status_filter()
+
+    def _tag_video_task_id(self, input_path: Path, task_id: str) -> None:
+        self.context.cache_store.execute(
+            f"UPDATE plugin_{PLUGIN_ID} SET task_id = ? WHERE file_path = ?",
+            (task_id, str(input_path)),
+        )
 
     def _process_selected(self) -> None:
         self._run()
