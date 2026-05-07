@@ -20,6 +20,7 @@
 - **[快速开始](packaging/quick-start.md)** - 一键打包快速参考
 - **[打包速查表](packaging/quick-reference.md)** - 常用命令和问题解决
 - **[构建脚本说明](packaging/BUILD_SCRIPTS.md)** - 所有构建脚本详解 ⭐ 新增
+- **[故障排除指南](packaging/TROUBLESHOOTING.md)** - 常见错误及解决方案 ⭐ 新增
 
 #### 详细教程
 - **[跨平台打包指南](packaging/cross-platform-packaging.md)** - ⭐ Windows + Linux 完整教程

@@ -20,12 +20,6 @@ for pf in plugin_files:
 
 print(f"Discovered plugins: {plugin_modules}")
 
-# Platform-specific data file format
-if sys.platform.startswith('win'):
-    data_sep = ';'
-else:
-    data_sep = ':'
-
 a = Analysis(
     ['putils' + path_sep + 'app.py'],
     pathex=[],
@@ -37,8 +31,9 @@ a = Analysis(
         ('putils' + path_sep + 'plugins' + path_sep + '*.py', 'putils' + path_sep + 'plugins'),
     ],
     hiddenimports=[
-        # Core putils modules
+        # Core putils modules - MUST be first
         'putils',
+        'putils.app',
         'putils.database',
         'putils.i18n',
         'putils.paths',
@@ -47,7 +42,17 @@ a = Analysis(
         'putils.tk_utils',
         # Plugin modules (dynamically discovered)
     ] + plugin_modules + [
-        # Standard library modules
+        # Critical standard library modules - ensure these are loaded early
+        'encodings',
+        'encodings.utf_8',
+        'encodings.latin_1',
+        'codecs',
+        '_collections_abc',
+        'os',
+        'sys',
+        'io',
+        'abc',
+        # Other standard library modules
         'zoneinfo',
         'json',
         'subprocess',
@@ -58,8 +63,6 @@ a = Analysis(
         'pkgutil',
         'shutil',
         'datetime',
-        'os',
-        'sys',
         'collections',
         'functools',
         'time',
@@ -72,10 +75,19 @@ a = Analysis(
         'sqlite3',
         'hashlib',
         'textwrap',
-        'io',
         'contextlib',
-        'abc',
         'enum',
+        'copy',
+        'weakref',
+        'types',
+        'operator',
+        're',
+        'string',
+        'errno',
+        'stat',
+        'genericpath',
+        'ntpath',
+        'posixpath',
     ],
     hookspath=[],
     hooksconfig={},
@@ -90,6 +102,12 @@ a = Analysis(
         'distutils',
         'setuptools',
         'pip',
+        # Exclude unnecessary modules to reduce size
+        'email',
+        'html',
+        'http',
+        'xml',
+        'urllib',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
